@@ -1,3 +1,4 @@
+// 本文件验证 JWT 签名、Claims 和有效期校验。
 package identity
 
 import (
@@ -46,14 +47,15 @@ func TestJWTAuthenticatorAuthenticate(t *testing.T) {
 		t.Fatalf("校验合法令牌失败：%v", err)
 	}
 	if authentication.Principal.UserID != "user-1" ||
+		authentication.Principal.SubjectType != SubjectUser ||
 		!authentication.Principal.HasRole("reader") {
 		t.Fatalf("身份内容不正确：%+v", authentication.Principal)
 	}
 	if len(authentication.Principal.Scopes) != 2 {
 		t.Fatalf("scope 数量不正确：%v", authentication.Principal.Scopes)
 	}
-	if authentication.SessionBindingID == "" {
-		t.Fatal("JWT 认证结果应包含 Session Binding ID")
+	if authentication.Principal.CredentialID == "" {
+		t.Fatal("JWT 认证结果应包含凭据标识")
 	}
 
 	_, err = authenticator.Authenticate(context.Background(), AuthenticationRequest{

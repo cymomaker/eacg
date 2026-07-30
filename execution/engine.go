@@ -72,6 +72,7 @@ func (e *Engine) Execute(ctx context.Context, request Request) (result Result, e
 	event := audit.Event{
 		RequestID:       request.RequestID,
 		TraceID:         request.TraceID,
+		SubjectType:     string(request.Principal.SubjectType),
 		TenantID:        request.Principal.TenantID,
 		UserID:          request.Principal.UserID,
 		AgentID:         request.Principal.AgentID,
@@ -98,7 +99,9 @@ func (e *Engine) Execute(ctx context.Context, request Request) (result Result, e
 	if !exists {
 		return Result{}, ErrNotFound
 	}
-	if !request.Principal.HasAllRoles(item.Descriptor().RequiredRoles) {
+	descriptor := item.Descriptor()
+	if !descriptor.AllowsPrincipal(request.Principal) ||
+		!request.Principal.HasAllRoles(descriptor.RequiredRoles) {
 		return Result{}, ErrForbidden
 	}
 	event.Allowed = true

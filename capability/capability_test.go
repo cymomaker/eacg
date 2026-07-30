@@ -1,3 +1,4 @@
+// 本文件验证类型化 Capability 和 JSON Schema 校验。
 package capability
 
 import (
@@ -5,12 +6,61 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/cymomaker/eacg/identity"
 )
 
+// greetInput 保存问候能力的输入。
 type greetInput struct {
 	Name string `json:"name" jsonschema:"来访者姓名"`
 }
 
+// TestCapabilityIdentityRequirement 验证默认和显式身份要求。
+func TestCapabilityIdentityRequirement(t *testing.T) {
+	t.Parallel()
+
+	item, err := New(Descriptor{
+		ID:          "any.v1",
+		Name:        "any",
+		Version:     "v1",
+		Description: "允许任意合法身份",
+		RiskLevel:   RiskR0,
+		ReadOnly:    true,
+	}, func(_ context.Context, _ RequestContext, input greetInput) (greetOutput, error) {
+		return greetOutput{Message: input.Name}, nil
+	})
+	if err != nil {
+		t.Fatalf("创建默认身份能力失败：%v", err)
+	}
+	if item.Descriptor().IdentityRequirement != IdentityAny {
+		t.Fatalf("空身份要求应规范化为 any：%q", item.Descriptor().IdentityRequirement)
+	}
+	service := identity.Principal{
+		SubjectType: identity.SubjectService,
+		TenantID:    "tenant-a",
+		ClientID:    "service-a",
+	}
+	if !item.Descriptor().AllowsPrincipal(service) {
+		t.Fatal("IdentityAny 应允许合法服务身份")
+	}
+
+	_, err = New(Descriptor{
+		ID:                  "invalid.v1",
+		Name:                "invalid",
+		Version:             "v1",
+		Description:         "非法身份要求",
+		RiskLevel:           RiskR0,
+		ReadOnly:            true,
+		IdentityRequirement: "unknown",
+	}, func(_ context.Context, _ RequestContext, input greetInput) (greetOutput, error) {
+		return greetOutput{Message: input.Name}, nil
+	})
+	if err == nil {
+		t.Fatal("非法身份要求不应创建成功")
+	}
+}
+
+// greetOutput 保存问候能力的输出。
 type greetOutput struct {
 	Message string `json:"message" jsonschema:"问候语"`
 }

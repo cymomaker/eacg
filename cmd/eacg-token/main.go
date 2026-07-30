@@ -11,6 +11,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// claims 保存演示 JWT 需要的企业身份字段。
 type claims struct {
 	TenantID string   `json:"tenant_id"`
 	Roles    []string `json:"roles"`

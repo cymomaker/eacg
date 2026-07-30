@@ -1,8 +1,9 @@
 GO ?= go
-BINARY := bin/eacg-example
+SERVER_BINARY := bin/eacg-example
+CLIENT_BINARY := bin/eacg-client
 PACKAGES := ./...
 
-.PHONY: all fmt vet test test-race cover build run run-api-key token clean docker-build
+.PHONY: all fmt vet test test-race cover build run run-api-key client client-api-key token clean docker-build
 
 all: fmt vet test build
 
@@ -24,7 +25,8 @@ cover:
 
 build:
 	mkdir -p bin
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o $(BINARY) ./cmd/eacg-example
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o $(SERVER_BINARY) ./cmd/eacg-example
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o $(CLIENT_BINARY) ./cmd/eacg-client
 
 run:
 	$(GO) run ./cmd/eacg-example
@@ -34,12 +36,21 @@ run-api-key:
 	EACG_API_KEY=0123456789abcdef0123456789abcdef \
 	$(GO) run ./cmd/eacg-example
 
+client:
+	EACG_CLIENT_TOKEN="$$( $(GO) run ./cmd/eacg-token )" \
+	$(GO) run ./cmd/eacg-client
+
+client-api-key:
+	EACG_CLIENT_AUTH_MODE=api_key \
+	EACG_CLIENT_API_KEY=0123456789abcdef0123456789abcdef \
+	$(GO) run ./cmd/eacg-client
+
 token:
 	$(GO) run ./cmd/eacg-token
 
 clean:
 	$(GO) clean -testcache
-	rm -f $(BINARY) coverage.out
+	rm -f $(SERVER_BINARY) $(CLIENT_BINARY) coverage.out
 
 docker-build:
 	docker build -t eacg-example:local .

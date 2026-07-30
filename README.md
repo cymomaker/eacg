@@ -1,414 +1,225 @@
 # EACG
 
-EACG（Enterprise Agent Capability Gateway）是一个面向企业 Agent 的能力网关 Go Module。
+EACG 是面向企业业务的 MCP Tool 网关。`v0.2.0` 只支持 MCP `2026-07-28`，使用无状态 Streamable HTTP。
 
-当前仓库实现 `v0.1.0` HTTP-only MVP：
+## 核心能力
 
-- MCP Streamable HTTP；
-- Typed Capability；
-- Bearer Token/JWT；
-- Service Token/API Key 与实际用户复合认证；
-- Tenant、Principal 和 Capability 级 RBAC；
-- 动态 Tool 可见性；
-- 输入输出 JSON Schema；
-- R0/R1 只读能力；
-- HTTP Connector；
-- 输出字段白名单与敏感字段遮盖；
-- 结构化审计；
-- Health、Readiness 和优雅停机。
+- Typed Capability 和自动 JSON Schema；
+- JWT、Service Token/API Key 认证；
+- 用户身份与服务身份明确区分；
+- 基于身份类型和角色的 Tool 可见性与执行时二次授权；
+- 输入输出校验、字段白名单和敏感字段遮盖；
+- HTTP Connector、结构化审计、健康检查和优雅停机；
+- 无状态部署，不需要会话存储或负载均衡粘滞。
 
-MVP 不包含 gRPC、Kitex、下游 MCP、STDIO、R2/R3 写操作、Prometheus 和 OpenTelemetry。
+普通 MCP 请求返回 `application/json`。只有将来启用 `subscriptions/listen` 时才使用 `text/event-stream` 长连接。
 
-## 环境要求
+## 快速启动
 
-- Go 1.25 或更高版本；
-- Make；
-- Docker，可选。
-
-## 运行测试
+要求 Go `1.25`。
 
 ```bash
 make test
-make test-race
-make vet
-```
-
-## 启动示例
-
-示例程序会同时启动：
-
-- EACG：`http://127.0.0.1:8080/mcp`
-- 演示下游 HTTP 服务：`http://127.0.0.1:8090`
-
-```bash
 make run
 ```
 
-默认使用 JWT。若要演示企业微信风格的固定 API Key 加用户 Header：
+默认地址：
+
+```text
+MCP:    http://127.0.0.1:8080/mcp
+Health: http://127.0.0.1:8080/health
+Ready:  http://127.0.0.1:8080/ready
+```
+
+生成演示 JWT：
+
+```bash
+TOKEN=$(make token | tail -n 1)
+```
+
+## JWT 完整调用示例
+
+### 1. 查询 Server 信息
+
+```bash
+curl -sS http://127.0.0.1:8080/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "server/discover",
+    "params": {
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+          "name": "curl-client",
+          "version": "1.0.0"
+        }
+      }
+    }
+  }'
+```
+
+### 2. 查询 Tool
+
+```bash
+curl -sS http://127.0.0.1:8080/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/list",
+    "params": {
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+          "name": "curl-client",
+          "version": "1.0.0"
+        }
+      }
+    }
+  }'
+```
+
+### 3. 调用 Tool
+
+```bash
+curl -sS http://127.0.0.1:8080/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/call" \
+  -H "Mcp-Name: get_profile" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "tools/call",
+    "params": {
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+          "name": "curl-client",
+          "version": "1.0.0"
+        }
+      },
+      "name": "get_profile",
+      "arguments": {
+        "user_id": "user-1001"
+      }
+    }
+  }'
+```
+
+每一次请求都必须重新携带认证信息、协议版本、客户端能力和客户端信息。
+
+## API Key 模式
+
+启动：
 
 ```bash
 make run-api-key
 ```
 
-另开一个终端生成测试 JWT：
+调用时把 JWT Header 替换为：
 
 ```bash
-make token
+-H "X-EACG-API-Key: 0123456789abcdef0123456789abcdef"
 ```
 
-默认令牌包含：
-
-- Tenant：`tenant-a`
-- User：`user-1`
-- Role：`reader`
-- 有效期：1 小时
-
-把令牌配置到 MCP Host 的 `Authorization: Bearer <token>` 请求头，然后连接：
+企业微信插件建议配置：
 
 ```text
-http://127.0.0.1:8080/mcp
+授权方式：Service token / API key
+位置：Header
+Parameter name：X-EACG-API-Key
+传输协议：Streamable HTTP
 ```
 
-可调用 Tool：
+内置 API Key 认证器把 Key 映射为服务身份，不要求 userid。企业微信等代理用户场景应由业务项目实现自定义 `Authenticator`，并通过可选 `SubjectHeader` 接收可信 requester userid。
 
-```json
-{
-  "name": "get_profile",
-  "arguments": {
-    "user_id": "42"
-  }
-}
-```
+## Go 教学客户端
 
-## 使用 curl 调用 MCP
+`cmd/eacg-client` 使用官方 Go SDK 展示真实协议流程，并对认证信息做脱敏。
 
-以下命令已经在本地示例服务上验证。整个会话必须使用同一个 `TOKEN` 和 `SESSION_ID`。
-
-先启动服务并生成 JWT：
+JWT 模式需要两个终端：
 
 ```bash
+# 终端一
 make run
+
+# 终端二
+make client
 ```
-
-另开一个终端执行：
-
-```bash
-TOKEN=$(make -s token)
-MCP_URL=http://127.0.0.1:8080/mcp
-HEADER_FILE=/tmp/eacg-mcp-headers
-```
-
-### 1. 初始化 MCP Session
-
-```bash
-curl -sS -N \
-  -D "$HEADER_FILE" \
-  -X POST "$MCP_URL" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "initialize",
-    "params": {
-      "protocolVersion": "2025-11-25",
-      "capabilities": {},
-      "clientInfo": {
-        "name": "curl-client",
-        "version": "1.0.0"
-      }
-    }
-  }'
-```
-
-响应使用 SSE 格式：
-
-```text
-event: message
-data: {"jsonrpc":"2.0","id":1,"result":{...}}
-```
-
-从响应头提取 Session ID：
-
-```bash
-SESSION_ID=$(
-  awk 'BEGIN{IGNORECASE=1} /^Mcp-Session-Id:/ {
-    gsub("\r", "", $2)
-    print $2
-  }' "$HEADER_FILE"
-)
-echo "$SESSION_ID"
-```
-
-### 2. 发送初始化完成通知
-
-```bash
-curl -sS -i \
-  -X POST "$MCP_URL" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -H 'Mcp-Protocol-Version: 2025-11-25' \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data '{
-    "jsonrpc": "2.0",
-    "method": "notifications/initialized"
-  }'
-```
-
-成功时返回 `HTTP 202 Accepted`。
-
-### 3. 查询可用 Tool
-
-```bash
-curl -sS -N \
-  -X POST "$MCP_URL" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -H 'Mcp-Protocol-Version: 2025-11-25' \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data '{
-    "jsonrpc": "2.0",
-    "id": 2,
-    "method": "tools/list",
-    "params": {}
-  }'
-```
-
-返回列表中应包含 `get_profile`。
-
-### 4. 调用 get_profile
-
-```bash
-curl -sS -N \
-  -X POST "$MCP_URL" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -H 'Mcp-Protocol-Version: 2025-11-25' \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data '{
-    "jsonrpc": "2.0",
-    "id": 3,
-    "method": "tools/call",
-    "params": {
-      "name": "get_profile",
-      "arguments": {
-        "user_id": "42"
-      }
-    }
-  }'
-```
-
-结构化结果示例：
-
-```json
-{
-  "email": "42@example.com",
-  "name": "示例用户",
-  "user_id": "42"
-}
-```
-
-### 5. 关闭 MCP Session
-
-```bash
-curl -sS -i \
-  -X DELETE "$MCP_URL" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -H 'Mcp-Protocol-Version: 2025-11-25'
-```
-
-成功关闭时返回 `HTTP 204 No Content`；如果 Session 已关闭或已过期，则可能返回 `404`。
-
-如果返回内容以 `event: message` 和 `data:` 开头，表示服务正在按 MCP Streamable HTTP 规范返回 SSE，而不是普通 JSON。
-
-## 使用 API Key 和 requester userid 调用
-
-API Key 模式使用两个 Header：
-
-- `X-EACG-API-Key`：认证企业微信机器人或其他调用应用；
-- `X-EACG-Requester-UserID`：标识当前实际提问用户。
-
-先执行 `make run-api-key`，然后准备调用参数：
-
-```bash
-API_KEY=0123456789abcdef0123456789abcdef
-REQUESTER_USER_ID=zhangsan
-MCP_URL=http://127.0.0.1:8080/mcp
-HEADER_FILE=/tmp/eacg-api-key-mcp-headers
-```
-
-初始化 MCP Session：
-
-```bash
-curl -sS -N \
-  -D "$HEADER_FILE" \
-  -X POST "$MCP_URL" \
-  -H "X-EACG-API-Key: $API_KEY" \
-  -H "X-EACG-Requester-UserID: $REQUESTER_USER_ID" \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "initialize",
-    "params": {
-      "protocolVersion": "2025-11-25",
-      "capabilities": {},
-      "clientInfo": {
-        "name": "curl-api-key-client",
-        "version": "1.0.0"
-      }
-    }
-  }'
-```
-
-提取 Session ID：
-
-```bash
-SESSION_ID=$(
-  awk 'BEGIN{IGNORECASE=1} /^Mcp-Session-Id:/ {
-    gsub("\r", "", $2)
-    print $2
-  }' "$HEADER_FILE"
-)
-echo "$SESSION_ID"
-```
-
-发送初始化完成通知：
-
-```bash
-curl -sS -i \
-  -X POST "$MCP_URL" \
-  -H "X-EACG-API-Key: $API_KEY" \
-  -H "X-EACG-Requester-UserID: $REQUESTER_USER_ID" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -H 'Mcp-Protocol-Version: 2025-11-25' \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data '{
-    "jsonrpc": "2.0",
-    "method": "notifications/initialized"
-  }'
-```
-
-查询 Tool：
-
-```bash
-curl -sS -N \
-  -X POST "$MCP_URL" \
-  -H "X-EACG-API-Key: $API_KEY" \
-  -H "X-EACG-Requester-UserID: $REQUESTER_USER_ID" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -H 'Mcp-Protocol-Version: 2025-11-25' \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data '{
-    "jsonrpc": "2.0",
-    "id": 2,
-    "method": "tools/list",
-    "params": {}
-  }'
-```
-
-调用 `get_profile`：
-
-```bash
-curl -sS -N \
-  -X POST "$MCP_URL" \
-  -H "X-EACG-API-Key: $API_KEY" \
-  -H "X-EACG-Requester-UserID: $REQUESTER_USER_ID" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -H 'Mcp-Protocol-Version: 2025-11-25' \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data '{
-    "jsonrpc": "2.0",
-    "id": 3,
-    "method": "tools/call",
-    "params": {
-      "name": "get_profile",
-      "arguments": {
-        "user_id": "42"
-      }
-    }
-  }'
-```
-
-关闭 Session：
-
-```bash
-curl -sS -i \
-  -X DELETE "$MCP_URL" \
-  -H "X-EACG-API-Key: $API_KEY" \
-  -H "X-EACG-Requester-UserID: $REQUESTER_USER_ID" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -H 'Mcp-Protocol-Version: 2025-11-25'
-```
-
-同一 Session 的每个请求都必须携带相同 API Key 和 requester userid。更换其中任意一项都会使 Session 身份校验失败。
-
-企业微信插件中应选择 `Header`，Parameter name 配置为 `X-EACG-API-Key`。requester userid Header 的实际名称由企业微信接入链路决定，再通过 `EACG_REQUESTER_USER_HEADER` 告诉 EACG。
-
-## Docker
-
-```bash
-make docker-build
-docker run --rm -p 8080:8080 \
-  -e EACG_JWT_SECRET=0123456789abcdef0123456789abcdef \
-  eacg-example:local
-```
-
-示例默认密钥只适合本地学习，生产环境必须使用企业密钥管理系统。
 
 API Key 模式：
 
 ```bash
-docker run --rm -p 8080:8080 \
-  -e EACG_AUTH_MODE=api_key \
-  -e EACG_API_KEY=0123456789abcdef0123456789abcdef \
-  -e EACG_CREDENTIAL_HEADER=X-EACG-API-Key \
-  -e EACG_REQUESTER_USER_HEADER=X-EACG-Requester-UserID \
-  eacg-example:local
+# 终端一
+make run-api-key
+
+# 终端二
+make client-api-key
 ```
 
-## 最小接入示例
+默认依次执行自动发现、`tools/list` 和 `tools/call get_profile`。也可以分步运行：
+
+```bash
+EACG_CLIENT_TOKEN="$TOKEN" go run ./cmd/eacg-client --action discover
+EACG_CLIENT_TOKEN="$TOKEN" go run ./cmd/eacg-client --action list
+EACG_CLIENT_TOKEN="$TOKEN" go run ./cmd/eacg-client --action call \
+  --tool get_profile \
+  --arguments '{"user_id":"user-1001"}'
+```
+
+协议追踪写入 stderr，业务结果写入 stdout。生产数据调试时可以使用 `--trace=false`。推荐通过环境变量传递 Token 和 API Key，避免密钥出现在 shell 历史中。
+
+## 业务接入
 
 ```go
-type Input struct {
-    ID string `json:"id"`
-}
-
-type Output struct {
-    ID   string `json:"id"`
-    Name string `json:"name"`
-}
-
-item, err := capability.New(capability.Descriptor{
-    ID:            "get_user.v1",
-    Name:          "get_user",
-    Version:       "v1",
-    Description:   "查询用户基础信息",
-    RiskLevel:     capability.RiskR1,
-    ReadOnly:      true,
-    RequiredRoles: []string{"reader"},
-}, func(ctx context.Context, request capability.RequestContext, input Input) (Output, error) {
-    // 在这里通过 HTTP Connector 调用企业业务服务。
-    return Output{ID: input.ID, Name: "示例用户"}, nil
-})
+app, err := eacg.New(
+    eacg.Config{
+        Name:                "business-mcp-server",
+        Version:             "v1.0.0",
+        Address:             "127.0.0.1:8080",
+        ExecutionTimeout:    5 * time.Second,
+        MaxRequestBodyBytes: 4 << 20,
+    },
+    eacg.HTTPAuthenticationConfig{
+        Authenticator: authenticator,
+    },
+    auditSink,
+)
 ```
 
-## 文档
+业务系统实现 `identity.Authenticator`，或直接使用 EACG 提供的 JWT/API Key 认证器。JWT 默认生成用户身份，API Key 默认生成服务身份。Capability 不直接读取 HTTP Header，租户、调用者和权限统一从 `identity.Principal` 获取；需要真实用户的 Tool 应声明 `IdentityUser`。
 
-- [技术架构与设计文档](docs/EACG_技术架构与设计文档.md)
-- [产品实现路线图](docs/EACG_产品实现路线图.md)
-- [MCP 协议工作流程入门](docs/MCP协议工作流程入门.md)
-- [MVP 代码架构与培训手册](docs/EACG_MVP代码架构与培训手册.md)
+## 工程命令
+
+```bash
+make test
+make test-race
+make vet
+make cover
+make build
+make docker-build
+```
+
+详细说明：
+
+- [MCP 协议工作流程](docs/MCP协议工作流程入门.md)
+- [代码架构与培训手册](docs/EACG_MVP代码架构与培训手册.md)
+- [identity 认证体系](docs/EACG_identity包架构与认证体系说明.md)
 - [企业认证兼容方案](docs/EACG_企业认证兼容方案.md)
-- [identity 包架构与认证体系说明](docs/EACG_identity包架构与认证体系说明.md)
-- [版本变更记录](CHANGELOG.md)
-- [安全策略](SECURITY.md)
+- [MCP Client 示例说明](docs/EACG_MCP客户端示例说明.md)

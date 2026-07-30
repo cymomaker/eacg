@@ -21,36 +21,23 @@ import (
 	"github.com/cymomaker/eacg/identity"
 )
 
+// profileInput 保存用户资料 Tool 的输入。
 type profileInput struct {
 	UserID string `json:"user_id" jsonschema:"要查询的用户 ID"`
 }
 
+// profileOutput 保存用户资料 Tool 的安全输出。
 type profileOutput struct {
 	UserID string `json:"user_id"`
 	Name   string `json:"name"`
 	Email  string `json:"email"`
 }
 
+// upstreamProfile 保存演示下游接口返回的数据。
 type upstreamProfile struct {
 	UserID string `json:"user_id"`
 	Name   string `json:"name"`
 	Email  string `json:"email"`
-}
-
-type demoSubjectResolver struct{}
-
-// Resolve 把外部用户标识映射为本地演示用户。
-func (demoSubjectResolver) Resolve(
-	_ context.Context,
-	request identity.SubjectResolveRequest,
-) (identity.Subject, error) {
-	return identity.Subject{
-		UserID:            request.ExternalID,
-		Roles:             []string{"reader"},
-		Scopes:            []string{"profile:read"},
-		Attrs:             map[string]string{"source": request.Provider},
-		PermissionVersion: "demo-v1",
-	}, nil
 }
 
 // main 组装示例能力并启动 EACG。
@@ -81,10 +68,11 @@ func main() {
 		log.Fatal(err)
 	}
 	app, err := eacg.New(eacg.Config{
-		Name:             "eacg-example",
-		Version:          "v0.1.0",
-		Address:          envOrDefault("EACG_ADDRESS", "127.0.0.1:8080"),
-		ExecutionTimeout: 5 * time.Second,
+		Name:                "eacg-example",
+		Version:             "v0.2.0",
+		Address:             envOrDefault("EACG_ADDRESS", "127.0.0.1:8080"),
+		ExecutionTimeout:    5 * time.Second,
+		MaxRequestBodyBytes: 4 << 20,
 	}, authentication, nil)
 	if err != nil {
 		log.Fatal(err)
@@ -93,7 +81,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("EACG 示例启动，MCP 地址：http://%s/mcp", envOrDefault("EACG_ADDRESS", "127.0.0.1:8080"))
+	log.Printf(
+		"EACG v0.2.0 示例启动，MCP 2026-07-28 地址：http://%s/mcp",
+		envOrDefault("EACG_ADDRESS", "127.0.0.1:8080"),
+	)
 	if err := app.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
@@ -123,7 +114,7 @@ func newAuthentication() (eacg.HTTPAuthenticationConfig, error) {
 	}
 }
 
-// newAPIKeyAuthentication 创建企业微信风格的双身份认证配置。
+// newAPIKeyAuthentication 创建纯服务身份的 API Key 认证配置。
 func newAPIKeyAuthentication() (eacg.HTTPAuthenticationConfig, error) {
 	rawKey := strings.TrimSpace(os.Getenv("EACG_API_KEY"))
 	if len(rawKey) < 32 {
@@ -135,25 +126,21 @@ func newAPIKeyAuthentication() (eacg.HTTPAuthenticationConfig, error) {
 	if err != nil {
 		return eacg.HTTPAuthenticationConfig{}, err
 	}
-	provider := envOrDefault("EACG_SUBJECT_PROVIDER", "wecom")
 	store, err := identity.NewMemoryAPIKeyStore(identity.APIKeyRecord{
-		CredentialID:    envOrDefault("EACG_API_KEY_ID", "wecom-demo-key"),
-		TenantID:        envOrDefault("EACG_TENANT_ID", "tenant-a"),
-		ClientID:        envOrDefault("EACG_CLIENT_ID", "wecom-bot"),
-		AgentID:         os.Getenv("EACG_AGENT_ID"),
-		Digest:          identity.DigestAPIKey(rawKey),
-		SubjectProvider: provider,
-		AllowedRoles:    []string{"reader"},
-		AllowedScopes:   []string{"profile:read"},
-		Version:         "demo-v1",
-		ExpiresAt:       expiresAt,
+		CredentialID: envOrDefault("EACG_API_KEY_ID", "service-demo-key"),
+		TenantID:     envOrDefault("EACG_TENANT_ID", "tenant-a"),
+		ClientID:     envOrDefault("EACG_CLIENT_ID", "eacg-service"),
+		AgentID:      os.Getenv("EACG_AGENT_ID"),
+		Digest:       identity.DigestAPIKey(rawKey),
+		Roles:        []string{"reader"},
+		Scopes:       []string{"profile:read"},
+		ExpiresAt:    expiresAt,
 	})
 	if err != nil {
 		return eacg.HTTPAuthenticationConfig{}, err
 	}
 	authenticator, err := identity.NewAPIKeyAuthenticator(
 		store,
-		demoSubjectResolver{},
 		identity.APIKeyAuthenticatorConfig{},
 	)
 	if err != nil {
@@ -162,8 +149,6 @@ func newAPIKeyAuthentication() (eacg.HTTPAuthenticationConfig, error) {
 	return eacg.HTTPAuthenticationConfig{
 		Authenticator:    authenticator,
 		CredentialHeader: envOrDefault("EACG_CREDENTIAL_HEADER", "X-EACG-API-Key"),
-		SubjectHeader:    envOrDefault("EACG_REQUESTER_USER_HEADER", "X-EACG-Requester-UserID"),
-		SubjectProvider:  provider,
 	}, nil
 }
 

@@ -1,3 +1,4 @@
+// 本文件验证审计事件的内存和日志写入行为。
 package audit
 
 import (

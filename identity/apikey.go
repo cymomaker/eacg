@@ -1,3 +1,4 @@
+// 本文件实现 API Key 服务身份认证。
 package identity
 
 import (
@@ -5,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -15,27 +17,23 @@ import (
 // ErrAPIKeyNotFound 表示没有找到对应的 API Key。
 var ErrAPIKeyNotFound = errors.New("API Key 不存在")
 
-// ErrSubjectNotFound 表示没有找到对应的企业用户。
-var ErrSubjectNotFound = errors.New("企业用户不存在")
-
+// 认证限制用于控制租约和凭据长度。
 const (
 	defaultAuthenticationLease = 5 * time.Minute
 	maxCredentialLength        = 8192
 )
 
-// APIKeyRecord 保存 API Key 对应的服务身份和最大权限。
+// APIKeyRecord 保存 API Key 对应的服务身份和权限。
 type APIKeyRecord struct {
-	CredentialID    string
-	TenantID        string
-	ClientID        string
-	AgentID         string
-	Digest          [32]byte
-	SubjectProvider string
-	AllowedRoles    []string
-	AllowedScopes   []string
-	Version         string
-	Disabled        bool
-	ExpiresAt       time.Time
+	CredentialID string
+	TenantID     string
+	ClientID     string
+	AgentID      string
+	Digest       [32]byte
+	Roles        []string
+	Scopes       []string
+	Disabled     bool
+	ExpiresAt    time.Time
 }
 
 // APIKeyStore 定义 API Key 摘要查询行为。
@@ -43,77 +41,42 @@ type APIKeyStore interface {
 	LookupByDigest(context.Context, [32]byte) (APIKeyRecord, error)
 }
 
-// SubjectResolveRequest 保存用户目录查询需要的信息。
-type SubjectResolveRequest struct {
-	TenantID   string
-	ClientID   string
-	AgentID    string
-	Provider   string
-	ExternalID string
-}
-
-// Subject 保存企业用户目录返回的内部身份。
-type Subject struct {
-	UserID            string
-	Roles             []string
-	Scopes            []string
-	Attrs             map[string]string
-	PermissionVersion string
-	Disabled          bool
-}
-
-// SubjectResolver 定义外部用户到企业内部身份的映射行为。
-type SubjectResolver interface {
-	Resolve(context.Context, SubjectResolveRequest) (Subject, error)
-}
-
 // APIKeyAuthenticatorConfig 定义 API Key 认证器参数。
 type APIKeyAuthenticatorConfig struct {
 	AuthenticationLease time.Duration
 }
 
-// APIKeyAuthenticator 组合服务凭据和企业用户身份。
+// APIKeyAuthenticator 使用 API Key 认证系统服务。
 type APIKeyAuthenticator struct {
-	store    APIKeyStore
-	resolver SubjectResolver
-	lease    time.Duration
-	now      func() time.Time
+	store APIKeyStore
+	lease time.Duration
+	now   func() time.Time
 }
 
-// NewAPIKeyAuthenticator 创建 API Key 复合身份认证器。
+// NewAPIKeyAuthenticator 创建 API Key 服务身份认证器。
 func NewAPIKeyAuthenticator(
 	store APIKeyStore,
-	resolver SubjectResolver,
 	config APIKeyAuthenticatorConfig,
 ) (*APIKeyAuthenticator, error) {
-	if store == nil || resolver == nil {
-		return nil, fmt.Errorf("API Key Store 和 Subject Resolver 不能为空")
+	if store == nil {
+		return nil, fmt.Errorf("API Key Store 不能为空")
 	}
 	if config.AuthenticationLease <= 0 {
 		config.AuthenticationLease = defaultAuthenticationLease
 	}
 	return &APIKeyAuthenticator{
-		store:    store,
-		resolver: resolver,
-		lease:    config.AuthenticationLease,
-		now:      time.Now,
+		store: store,
+		lease: config.AuthenticationLease,
+		now:   time.Now,
 	}, nil
 }
 
-// Authenticate 校验服务凭据并解析实际企业用户。
+// Authenticate 校验 API Key 并返回服务身份。
 func (a *APIKeyAuthenticator) Authenticate(
 	ctx context.Context,
 	request AuthenticationRequest,
 ) (Authentication, error) {
-	if !validCredential(request.Credential) || request.Subject == nil {
-		return Authentication{}, ErrUnauthenticated
-	}
-	provider := request.Subject.Provider
-	externalID := request.Subject.ExternalID
-	if provider != strings.TrimSpace(provider) ||
-		externalID != strings.TrimSpace(externalID) ||
-		!validIdentityValue(provider, 128) ||
-		!validIdentityValue(externalID, 256) {
+	if !validCredential(request.Credential) {
 		return Authentication{}, ErrUnauthenticated
 	}
 
@@ -125,65 +88,27 @@ func (a *APIKeyAuthenticator) Authenticate(
 		return Authentication{}, fmt.Errorf("查询 API Key：%w", err)
 	}
 	now := a.now()
-	if err := validateAPIKeyRecord(record, provider, now); err != nil {
+	if err := validateAPIKeyRecord(record, now); err != nil {
 		return Authentication{}, ErrUnauthenticated
 	}
 
-	subject, err := a.resolver.Resolve(ctx, SubjectResolveRequest{
-		TenantID:   record.TenantID,
-		ClientID:   record.ClientID,
-		AgentID:    record.AgentID,
-		Provider:   provider,
-		ExternalID: externalID,
-	})
-	if err != nil {
-		if errors.Is(err, ErrSubjectNotFound) {
-			return Authentication{}, ErrUnauthenticated
-		}
-		return Authentication{}, fmt.Errorf("解析企业用户：%w", err)
-	}
-	if subject.Disabled || !validIdentityValue(subject.UserID, 256) {
-		return Authentication{}, ErrUnauthenticated
-	}
-
-	roles := intersect(record.AllowedRoles, subject.Roles)
-	scopes := intersect(record.AllowedScopes, subject.Scopes)
 	principal := Principal{
-		TenantID:        record.TenantID,
-		UserID:          subject.UserID,
-		AgentID:         record.AgentID,
-		ClientID:        record.ClientID,
-		AuthMethod:      "api_key",
-		CredentialID:    record.CredentialID,
-		SubjectProvider: provider,
-		Roles:           roles,
-		Scopes:          scopes,
-		Attrs:           cloneAttrs(subject.Attrs),
+		SubjectType:  SubjectService,
+		TenantID:     record.TenantID,
+		AgentID:      record.AgentID,
+		ClientID:     record.ClientID,
+		AuthMethod:   "api_key",
+		CredentialID: record.CredentialID,
+		Roles:        uniqueValues(record.Roles),
+		Scopes:       uniqueValues(record.Scopes),
 	}
-	bindingID, err := buildSessionBinding(sessionBindingInput{
-		TenantID:          principal.TenantID,
-		ClientID:          principal.ClientID,
-		AgentID:           principal.AgentID,
-		UserID:            principal.UserID,
-		CredentialID:      record.CredentialID,
-		CredentialVersion: record.Version,
-		PermissionVersion: subject.PermissionVersion,
-		Roles:             roles,
-		Scopes:            scopes,
-	})
-	if err != nil {
-		return Authentication{}, fmt.Errorf("生成会话绑定标识：%w", err)
-	}
-
 	expiresAt := now.Add(a.lease)
 	if !record.ExpiresAt.IsZero() && record.ExpiresAt.Before(expiresAt) {
 		expiresAt = record.ExpiresAt
 	}
 	return Authentication{
-		Principal:        principal,
-		CredentialID:     record.CredentialID,
-		SessionBindingID: bindingID,
-		ExpiresAt:        expiresAt,
+		Principal: principal,
+		ExpiresAt: expiresAt,
 	}, nil
 }
 
@@ -211,16 +136,15 @@ func NewMemoryAPIKeyStore(records ...APIKeyRecord) (*MemoryAPIKeyStore, error) {
 
 // Put 新增或替换一条 API Key 记录。
 func (s *MemoryAPIKeyStore) Put(record APIKeyRecord) error {
-	if record.CredentialID == "" || record.TenantID == "" ||
-		record.ClientID == "" || record.SubjectProvider == "" {
+	if !validAPIKeyIdentity(record) {
 		return fmt.Errorf("API Key 记录缺少必要身份字段")
 	}
 	if record.Digest == ([32]byte{}) {
 		return fmt.Errorf("API Key 摘要不能为空")
 	}
 	cloned := record
-	cloned.AllowedRoles = append([]string(nil), record.AllowedRoles...)
-	cloned.AllowedScopes = append([]string(nil), record.AllowedScopes...)
+	cloned.Roles = append([]string(nil), record.Roles...)
+	cloned.Scopes = append([]string(nil), record.Scopes...)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records[record.Digest] = cloned
@@ -235,17 +159,17 @@ func (s *MemoryAPIKeyStore) LookupByDigest(_ context.Context, digest [32]byte) (
 	if !ok {
 		return APIKeyRecord{}, ErrAPIKeyNotFound
 	}
-	record.AllowedRoles = append([]string(nil), record.AllowedRoles...)
-	record.AllowedScopes = append([]string(nil), record.AllowedScopes...)
+	record.Roles = append([]string(nil), record.Roles...)
+	record.Scopes = append([]string(nil), record.Scopes...)
 	return record, nil
 }
 
 // validateAPIKeyRecord 检查服务凭据是否仍可使用。
-func validateAPIKeyRecord(record APIKeyRecord, provider string, now time.Time) error {
-	if record.CredentialID == "" || record.TenantID == "" || record.ClientID == "" {
+func validateAPIKeyRecord(record APIKeyRecord, now time.Time) error {
+	if !validAPIKeyIdentity(record) {
 		return ErrUnauthenticated
 	}
-	if record.Disabled || record.SubjectProvider != provider {
+	if record.Disabled {
 		return ErrUnauthenticated
 	}
 	if !record.ExpiresAt.IsZero() && !record.ExpiresAt.After(now) {
@@ -254,27 +178,32 @@ func validateAPIKeyRecord(record APIKeyRecord, provider string, now time.Time) e
 	return nil
 }
 
-// intersect 返回两组权限的有序交集。
-func intersect(maximum, assigned []string) []string {
-	allowed := make(map[string]struct{}, len(maximum))
-	for _, value := range maximum {
-		if value != "" {
-			allowed[value] = struct{}{}
-		}
+// validAPIKeyIdentity 检查服务身份字段是否安全且完整。
+func validAPIKeyIdentity(record APIKeyRecord) bool {
+	if !validIdentityValue(record.CredentialID, 256) ||
+		!validIdentityValue(record.TenantID, 256) ||
+		!validIdentityValue(record.ClientID, 256) {
+		return false
 	}
-	var result []string
-	seen := make(map[string]struct{}, len(assigned))
-	for _, value := range assigned {
-		if _, ok := allowed[value]; !ok {
+	return record.AgentID == "" || validIdentityValue(record.AgentID, 256)
+}
+
+// uniqueValues 去除空值和重复权限，并保持稳定顺序。
+func uniqueValues(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value == "" {
 			continue
 		}
-		if _, ok := seen[value]; ok {
+		if _, exists := seen[value]; exists {
 			continue
 		}
 		seen[value] = struct{}{}
 		result = append(result, value)
 	}
-	return sortedUnique(result)
+	sort.Strings(result)
+	return result
 }
 
 // validCredential 检查凭据长度和字符是否适合放入 HTTP Header。
@@ -282,9 +211,13 @@ func validCredential(value string) bool {
 	return value != "" && len(value) <= maxCredentialLength && validHeaderValue(value)
 }
 
-// validIdentityValue 检查身份字段长度和控制字符。
+// validIdentityValue 检查身份值的长度、空格和控制字符。
 func validIdentityValue(value string, maxLength int) bool {
-	return value != "" && utf8.ValidString(value) && len(value) <= maxLength && validHeaderValue(value)
+	return value != "" &&
+		value == strings.TrimSpace(value) &&
+		utf8.ValidString(value) &&
+		len(value) <= maxLength &&
+		validHeaderValue(value)
 }
 
 // validHeaderValue 拒绝换行符和其他控制字符。

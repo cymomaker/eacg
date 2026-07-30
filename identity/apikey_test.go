@@ -1,3 +1,4 @@
+// 本文件验证 API Key 服务身份认证。
 package identity
 
 import (
@@ -7,48 +8,43 @@ import (
 	"time"
 )
 
-type staticSubjectResolver struct {
-	subject Subject
-	err     error
+// failingAPIKeyStore 模拟 API Key 存储异常。
+type failingAPIKeyStore struct{}
+
+// LookupByDigest 返回固定的存储异常。
+func (failingAPIKeyStore) LookupByDigest(context.Context, [32]byte) (APIKeyRecord, error) {
+	return APIKeyRecord{}, errors.New("database unavailable")
 }
 
-// Resolve 为认证测试返回固定企业用户。
-func (r staticSubjectResolver) Resolve(
-	_ context.Context,
-	_ SubjectResolveRequest,
-) (Subject, error) {
-	return r.subject, r.err
+// fixedAPIKeyStore 返回固定记录，便于验证外部存储中的脏数据。
+type fixedAPIKeyStore struct {
+	record APIKeyRecord
 }
 
-// TestAPIKeyAuthenticatorAuthenticate 验证服务权限和用户权限会取交集。
-func TestAPIKeyAuthenticatorAuthenticate(t *testing.T) {
+// LookupByDigest 返回固定 API Key 记录。
+func (s fixedAPIKeyStore) LookupByDigest(context.Context, [32]byte) (APIKeyRecord, error) {
+	return s.record, nil
+}
+
+// TestAPIKeyAuthenticatorAuthenticateService 验证 API Key 不需要用户身份。
+func TestAPIKeyAuthenticatorAuthenticateService(t *testing.T) {
 	t.Parallel()
 
-	now := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)
 	rawKey := "0123456789abcdef0123456789abcdef"
 	store, err := NewMemoryAPIKeyStore(APIKeyRecord{
-		CredentialID:    "key-1",
-		TenantID:        "tenant-a",
-		ClientID:        "wecom-bot",
-		AgentID:         "agent-1",
-		Digest:          DigestAPIKey(rawKey),
-		SubjectProvider: "wecom",
-		AllowedRoles:    []string{"reader", "admin"},
-		AllowedScopes:   []string{"profile:read"},
-		Version:         "v1",
+		CredentialID: "key-1",
+		TenantID:     "tenant-a",
+		ClientID:     "insight-service",
+		AgentID:      "agent-1",
+		Digest:       DigestAPIKey(rawKey),
+		Roles:        []string{"reader", "reader", ""},
+		Scopes:       []string{"profile:read", "profile:read"},
 	})
 	if err != nil {
 		t.Fatalf("创建 Key Store 失败：%v", err)
 	}
-	authenticator, err := NewAPIKeyAuthenticator(store, staticSubjectResolver{
-		subject: Subject{
-			UserID:            "user-1",
-			Roles:             []string{"reader", "operator"},
-			Scopes:            []string{"profile:read", "profile:write"},
-			Attrs:             map[string]string{"department": "engineering"},
-			PermissionVersion: "p1",
-		},
-	}, APIKeyAuthenticatorConfig{})
+	authenticator, err := NewAPIKeyAuthenticator(store, APIKeyAuthenticatorConfig{})
 	if err != nil {
 		t.Fatalf("创建认证器失败：%v", err)
 	}
@@ -56,64 +52,89 @@ func TestAPIKeyAuthenticatorAuthenticate(t *testing.T) {
 
 	result, err := authenticator.Authenticate(context.Background(), AuthenticationRequest{
 		Credential: rawKey,
-		Subject: &SubjectAssertion{
-			Provider:   "wecom",
-			ExternalID: "zhangsan",
-		},
 	})
 	if err != nil {
 		t.Fatalf("认证失败：%v", err)
 	}
-	if result.Principal.TenantID != "tenant-a" ||
-		result.Principal.UserID != "user-1" ||
-		result.Principal.AuthMethod != "api_key" {
-		t.Fatalf("Principal 不正确：%+v", result.Principal)
+	principal := result.Principal
+	if principal.SubjectType != SubjectService ||
+		principal.TenantID != "tenant-a" ||
+		principal.ClientID != "insight-service" ||
+		principal.UserID != "" ||
+		principal.AuthMethod != "api_key" ||
+		principal.CredentialID != "key-1" {
+		t.Fatalf("服务 Principal 不正确：%+v", principal)
 	}
-	if len(result.Principal.Roles) != 1 || result.Principal.Roles[0] != "reader" {
-		t.Fatalf("角色交集不正确：%v", result.Principal.Roles)
+	if len(principal.Roles) != 1 || principal.Roles[0] != "reader" {
+		t.Fatalf("角色不正确：%v", principal.Roles)
 	}
-	if len(result.Principal.Scopes) != 1 || result.Principal.Scopes[0] != "profile:read" {
-		t.Fatalf("Scope 交集不正确：%v", result.Principal.Scopes)
+	if len(principal.Scopes) != 1 || principal.Scopes[0] != "profile:read" {
+		t.Fatalf("Scope 不正确：%v", principal.Scopes)
 	}
 	if result.ExpiresAt != now.Add(defaultAuthenticationLease) {
 		t.Fatalf("默认认证租约不正确：%v", result.ExpiresAt)
 	}
-	if result.SessionBindingID == "" || result.SessionBindingID == rawKey {
-		t.Fatal("会话绑定标识不能为空或包含明文 Key")
-	}
 }
 
-// TestAPIKeyAuthenticatorUsesEarlierKeyExpiry 验证 Key 过期时间会限制认证租约。
-func TestAPIKeyAuthenticatorUsesEarlierKeyExpiry(t *testing.T) {
+// TestAPIKeyAuthenticatorIgnoresOptionalSubject 验证内置认证器不处理业务用户声明。
+func TestAPIKeyAuthenticatorIgnoresOptionalSubject(t *testing.T) {
 	t.Parallel()
 
-	now := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
-	rawKey := "abcdef0123456789abcdef0123456789"
-	keyExpiry := now.Add(time.Minute)
+	rawKey := "0123456789abcdef0123456789abcdef"
 	store, err := NewMemoryAPIKeyStore(APIKeyRecord{
-		CredentialID:    "key-1",
-		TenantID:        "tenant-a",
-		ClientID:        "wecom-bot",
-		Digest:          DigestAPIKey(rawKey),
-		SubjectProvider: "wecom",
-		Version:         "v1",
-		ExpiresAt:       keyExpiry,
+		CredentialID: "key-1",
+		TenantID:     "tenant-a",
+		ClientID:     "service-a",
+		Digest:       DigestAPIKey(rawKey),
 	})
 	if err != nil {
 		t.Fatalf("创建 Key Store 失败：%v", err)
 	}
-	authenticator, err := NewAPIKeyAuthenticator(store, staticSubjectResolver{
-		subject: Subject{UserID: "user-1", PermissionVersion: "p1"},
-	}, APIKeyAuthenticatorConfig{AuthenticationLease: 5 * time.Minute})
+	authenticator, err := NewAPIKeyAuthenticator(store, APIKeyAuthenticatorConfig{})
 	if err != nil {
 		t.Fatalf("创建认证器失败：%v", err)
 	}
-	authenticator.now = func() time.Time { return now }
-
 	result, err := authenticator.Authenticate(context.Background(), AuthenticationRequest{
 		Credential: rawKey,
 		Subject:    &SubjectAssertion{Provider: "wecom", ExternalID: "zhangsan"},
 	})
+	if err != nil {
+		t.Fatalf("认证失败：%v", err)
+	}
+	if result.Principal.SubjectType != SubjectService || result.Principal.UserID != "" {
+		t.Fatalf("用户声明不应改变服务身份：%+v", result.Principal)
+	}
+}
+
+// TestAPIKeyAuthenticatorUsesEarlierKeyExpiry 验证 Key 过期时间限制认证租约。
+func TestAPIKeyAuthenticatorUsesEarlierKeyExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)
+	rawKey := "abcdef0123456789abcdef0123456789"
+	keyExpiry := now.Add(time.Minute)
+	store, err := NewMemoryAPIKeyStore(APIKeyRecord{
+		CredentialID: "key-1",
+		TenantID:     "tenant-a",
+		ClientID:     "service-a",
+		Digest:       DigestAPIKey(rawKey),
+		ExpiresAt:    keyExpiry,
+	})
+	if err != nil {
+		t.Fatalf("创建 Key Store 失败：%v", err)
+	}
+	authenticator, err := NewAPIKeyAuthenticator(
+		store,
+		APIKeyAuthenticatorConfig{AuthenticationLease: 5 * time.Minute},
+	)
+	if err != nil {
+		t.Fatalf("创建认证器失败：%v", err)
+	}
+	authenticator.now = func() time.Time { return now }
+	result, err := authenticator.Authenticate(
+		context.Background(),
+		AuthenticationRequest{Credential: rawKey},
+	)
 	if err != nil {
 		t.Fatalf("认证失败：%v", err)
 	}
@@ -122,159 +143,111 @@ func TestAPIKeyAuthenticatorUsesEarlierKeyExpiry(t *testing.T) {
 	}
 }
 
-// TestAPIKeyAuthenticatorRejectsInvalidIdentity 验证非法凭据和用户身份会被拒绝。
-func TestAPIKeyAuthenticatorRejectsInvalidIdentity(t *testing.T) {
+// TestAPIKeyAuthenticatorRejectsInvalidKeys 验证非法、停用和过期凭据被拒绝。
+func TestAPIKeyAuthenticatorRejectsInvalidKeys(t *testing.T) {
 	t.Parallel()
 
+	now := time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)
 	rawKey := "0123456789abcdef0123456789abcdef"
-	store, err := NewMemoryAPIKeyStore(APIKeyRecord{
-		CredentialID:    "key-1",
-		TenantID:        "tenant-a",
-		ClientID:        "wecom-bot",
-		Digest:          DigestAPIKey(rawKey),
-		SubjectProvider: "wecom",
-	})
-	if err != nil {
-		t.Fatalf("创建 Key Store 失败：%v", err)
-	}
-	authenticator, err := NewAPIKeyAuthenticator(store, staticSubjectResolver{
-		subject: Subject{UserID: "user-1"},
-	}, APIKeyAuthenticatorConfig{})
-	if err != nil {
-		t.Fatalf("创建认证器失败：%v", err)
-	}
-
-	tests := []AuthenticationRequest{
-		{Credential: rawKey},
-		{Credential: "wrong", Subject: &SubjectAssertion{Provider: "wecom", ExternalID: "user"}},
-		{Credential: rawKey, Subject: &SubjectAssertion{Provider: "other", ExternalID: "user"}},
-		{Credential: rawKey, Subject: &SubjectAssertion{Provider: "wecom", ExternalID: "\nuser"}},
-	}
-	for _, request := range tests {
-		if _, err := authenticator.Authenticate(context.Background(), request); !errors.Is(err, ErrUnauthenticated) {
-			t.Fatalf("非法认证请求应返回 ErrUnauthenticated，实际为：%v", err)
-		}
-	}
-}
-
-// TestAPIKeySessionBindingChangesWithPermissionVersion 验证权限版本变化会使会话绑定失效。
-func TestAPIKeySessionBindingChangesWithPermissionVersion(t *testing.T) {
-	t.Parallel()
-
-	rawKey := "0123456789abcdef0123456789abcdef"
-	store, err := NewMemoryAPIKeyStore(APIKeyRecord{
-		CredentialID:    "key-1",
-		TenantID:        "tenant-a",
-		ClientID:        "wecom-bot",
-		Digest:          DigestAPIKey(rawKey),
-		SubjectProvider: "wecom",
-		AllowedRoles:    []string{"reader"},
-		Version:         "v1",
-	})
-	if err != nil {
-		t.Fatalf("创建 Key Store 失败：%v", err)
-	}
-	first, err := NewAPIKeyAuthenticator(store, staticSubjectResolver{
-		subject: Subject{UserID: "user-1", Roles: []string{"reader"}, PermissionVersion: "p1"},
-	}, APIKeyAuthenticatorConfig{})
-	if err != nil {
-		t.Fatalf("创建第一个认证器失败：%v", err)
-	}
-	second, err := NewAPIKeyAuthenticator(store, staticSubjectResolver{
-		subject: Subject{UserID: "user-1", Roles: []string{"reader"}, PermissionVersion: "p2"},
-	}, APIKeyAuthenticatorConfig{})
-	if err != nil {
-		t.Fatalf("创建第二个认证器失败：%v", err)
-	}
-	request := AuthenticationRequest{
-		Credential: rawKey,
-		Subject:    &SubjectAssertion{Provider: "wecom", ExternalID: "zhangsan"},
-	}
-	firstResult, err := first.Authenticate(context.Background(), request)
-	if err != nil {
-		t.Fatalf("第一次认证失败：%v", err)
-	}
-	secondResult, err := second.Authenticate(context.Background(), request)
-	if err != nil {
-		t.Fatalf("第二次认证失败：%v", err)
-	}
-	if firstResult.SessionBindingID == secondResult.SessionBindingID {
-		t.Fatal("权限版本变化后会话绑定标识应变化")
-	}
-}
-
-// TestAPIKeyAuthenticatorRejectsDisabledOrExpiredKey 验证停用和过期的 Key 无法认证。
-func TestAPIKeyAuthenticatorRejectsDisabledOrExpiredKey(t *testing.T) {
-	t.Parallel()
-
-	now := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
-	rawKey := "0123456789abcdef0123456789abcdef"
-	tests := []APIKeyRecord{
+	records := []APIKeyRecord{
 		{
-			CredentialID:    "disabled-key",
-			TenantID:        "tenant-a",
-			ClientID:        "wecom-bot",
-			Digest:          DigestAPIKey(rawKey),
-			SubjectProvider: "wecom",
-			Disabled:        true,
+			CredentialID: "disabled-key",
+			TenantID:     "tenant-a",
+			ClientID:     "service-a",
+			Digest:       DigestAPIKey(rawKey),
+			Disabled:     true,
 		},
 		{
-			CredentialID:    "expired-key",
-			TenantID:        "tenant-a",
-			ClientID:        "wecom-bot",
-			Digest:          DigestAPIKey(rawKey),
-			SubjectProvider: "wecom",
-			ExpiresAt:       now.Add(-time.Minute),
+			CredentialID: "expired-key",
+			TenantID:     "tenant-a",
+			ClientID:     "service-a",
+			Digest:       DigestAPIKey(rawKey),
+			ExpiresAt:    now.Add(-time.Minute),
 		},
 	}
-	for _, record := range tests {
+	for _, record := range records {
 		store, err := NewMemoryAPIKeyStore(record)
 		if err != nil {
 			t.Fatalf("创建 Key Store 失败：%v", err)
 		}
-		authenticator, err := NewAPIKeyAuthenticator(store, staticSubjectResolver{
-			subject: Subject{UserID: "user-1"},
-		}, APIKeyAuthenticatorConfig{})
+		authenticator, err := NewAPIKeyAuthenticator(store, APIKeyAuthenticatorConfig{})
 		if err != nil {
 			t.Fatalf("创建认证器失败：%v", err)
 		}
 		authenticator.now = func() time.Time { return now }
-		_, err = authenticator.Authenticate(context.Background(), AuthenticationRequest{
-			Credential: rawKey,
-			Subject:    &SubjectAssertion{Provider: "wecom", ExternalID: "zhangsan"},
-		})
+		_, err = authenticator.Authenticate(
+			context.Background(),
+			AuthenticationRequest{Credential: rawKey},
+		)
 		if !errors.Is(err, ErrUnauthenticated) {
 			t.Fatalf("停用或过期 Key 应认证失败，实际为：%v", err)
 		}
 	}
-}
 
-// TestAPIKeyAuthenticatorRejectsDisabledSubject 验证停用用户无法认证。
-func TestAPIKeyAuthenticatorRejectsDisabledSubject(t *testing.T) {
-	t.Parallel()
-
-	rawKey := "0123456789abcdef0123456789abcdef"
 	store, err := NewMemoryAPIKeyStore(APIKeyRecord{
-		CredentialID:    "key-1",
-		TenantID:        "tenant-a",
-		ClientID:        "wecom-bot",
-		Digest:          DigestAPIKey(rawKey),
-		SubjectProvider: "wecom",
+		CredentialID: "valid-key",
+		TenantID:     "tenant-a",
+		ClientID:     "service-a",
+		Digest:       DigestAPIKey(rawKey),
 	})
 	if err != nil {
 		t.Fatalf("创建 Key Store 失败：%v", err)
 	}
-	authenticator, err := NewAPIKeyAuthenticator(store, staticSubjectResolver{
-		subject: Subject{UserID: "user-1", Disabled: true},
+	authenticator, err := NewAPIKeyAuthenticator(store, APIKeyAuthenticatorConfig{})
+	if err != nil {
+		t.Fatalf("创建认证器失败：%v", err)
+	}
+	if _, err := authenticator.Authenticate(
+		context.Background(),
+		AuthenticationRequest{Credential: "wrong"},
+	); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("错误 Key 应认证失败，实际为：%v", err)
+	}
+}
+
+// TestAPIKeyAuthenticatorReturnsStoreError 验证存储异常保留错误链。
+func TestAPIKeyAuthenticatorReturnsStoreError(t *testing.T) {
+	t.Parallel()
+
+	authenticator, err := NewAPIKeyAuthenticator(failingAPIKeyStore{}, APIKeyAuthenticatorConfig{})
+	if err != nil {
+		t.Fatalf("创建认证器失败：%v", err)
+	}
+	_, err = authenticator.Authenticate(context.Background(), AuthenticationRequest{
+		Credential: "0123456789abcdef0123456789abcdef",
+	})
+	if err == nil || errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("存储异常不应伪装成无效凭据：%v", err)
+	}
+}
+
+// TestMemoryAPIKeyStoreRejectsMissingClientID 验证服务记录必须包含 ClientID。
+func TestMemoryAPIKeyStoreRejectsMissingClientID(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewMemoryAPIKeyStore(APIKeyRecord{
+		CredentialID: "key-1",
+		TenantID:     "tenant-a",
+		Digest:       DigestAPIKey("0123456789abcdef0123456789abcdef"),
+	})
+	if err == nil {
+		t.Fatal("缺少 ClientID 的服务凭据不应保存")
+	}
+
+	authenticator, err := NewAPIKeyAuthenticator(fixedAPIKeyStore{
+		record: APIKeyRecord{
+			CredentialID: "key-1",
+			TenantID:     "tenant-a",
+			Digest:       DigestAPIKey("0123456789abcdef0123456789abcdef"),
+		},
 	}, APIKeyAuthenticatorConfig{})
 	if err != nil {
 		t.Fatalf("创建认证器失败：%v", err)
 	}
 	_, err = authenticator.Authenticate(context.Background(), AuthenticationRequest{
-		Credential: rawKey,
-		Subject:    &SubjectAssertion{Provider: "wecom", ExternalID: "zhangsan"},
+		Credential: "0123456789abcdef0123456789abcdef",
 	})
 	if !errors.Is(err, ErrUnauthenticated) {
-		t.Fatalf("停用用户应认证失败，实际为：%v", err)
+		t.Fatalf("外部存储缺少 ClientID 时应认证失败：%v", err)
 	}
 }

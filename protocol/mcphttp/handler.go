@@ -20,10 +20,19 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// principalExtraKey 是 SDK TokenInfo 中保存 Principal 的键。
 const principalExtraKey = "eacg.principal"
 
+// 协议常量用于限制版本和默认请求体大小。
+const (
+	protocolVersion       = "2026-07-28"
+	defaultMaxRequestBody = 4 << 20
+)
+
+// contextKey 避免请求上下文键与其他包冲突。
 type contextKey string
 
+// 请求上下文键保存链路标识。
 const (
 	requestIDKey contextKey = "request_id"
 	traceIDKey   contextKey = "trace_id"
@@ -31,18 +40,18 @@ const (
 
 // Config 定义 MCP HTTP Handler 参数。
 type Config struct {
-	Name             string
-	Version          string
-	Registry         *registry.Registry
-	Engine           *execution.Engine
-	Authenticator    identity.Authenticator
-	CredentialHeader string
-	SubjectHeader    string
-	SubjectProvider  string
-	Logger           *slog.Logger
-	SessionTimeout   time.Duration
-	AllowedOrigins   []string
-	ResourceMetaURL  string
+	Name                string
+	Version             string
+	Registry            *registry.Registry
+	Engine              *execution.Engine
+	Authenticator       identity.Authenticator
+	CredentialHeader    string
+	SubjectHeader       string
+	SubjectProvider     string
+	Logger              *slog.Logger
+	MaxRequestBodyBytes int64
+	AllowedOrigins      []string
+	ResourceMetaURL     string
 }
 
 // New 创建带认证和 Origin 防护的 MCP HTTP Handler。
@@ -62,8 +71,15 @@ func New(config Config) (http.Handler, error) {
 	if config.Logger == nil {
 		config.Logger = slog.Default()
 	}
-	if config.SessionTimeout <= 0 {
-		config.SessionTimeout = 30 * time.Minute
+	if config.MaxRequestBodyBytes == 0 {
+		config.MaxRequestBodyBytes = defaultMaxRequestBody
+	}
+	if config.MaxRequestBodyBytes < 0 {
+		return nil, fmt.Errorf("MCP 请求体大小限制不能小于零")
+	}
+	protection, err := newCrossOriginProtection(config.AllowedOrigins)
+	if err != nil {
+		return nil, err
 	}
 
 	streamable := mcp.NewStreamableHTTPHandler(
@@ -75,8 +91,11 @@ func New(config Config) (http.Handler, error) {
 			return buildServer(config, principal)
 		},
 		&mcp.StreamableHTTPOptions{
-			Logger:         config.Logger,
-			SessionTimeout: config.SessionTimeout,
+			Stateless:                    true,
+			JSONResponse:                 true,
+			Logger:                       config.Logger,
+			MaxRequestBodyBytes:          config.MaxRequestBodyBytes,
+			PropagateRequestCancellation: true,
 		},
 	)
 
@@ -84,13 +103,14 @@ func New(config Config) (http.Handler, error) {
 	authMiddleware := mcpauth.RequireBearerToken(verifier, &mcpauth.RequireBearerTokenOptions{
 		ResourceMetadataURL: config.ResourceMetaURL,
 	})
-	handler := authMiddleware(streamable)
+	handler := protocolMiddleware(streamable)
+	handler = authMiddleware(handler)
 	if config.CredentialHeader != "" {
 		handler = credentialHeaderMiddleware(config.CredentialHeader, config.Logger, handler)
 	} else {
 		handler = bearerCredentialLogMiddleware(config.Logger, handler)
 	}
-	handler = originMiddleware(config.AllowedOrigins, handler)
+	handler = protection.Handler(handler)
 	handler = requestContextMiddleware(handler)
 	return handler, nil
 }
@@ -100,13 +120,13 @@ func buildServer(config Config, principal identity.Principal) *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: config.Name, Version: config.Version},
 		&mcp.ServerOptions{
-			Logger:    config.Logger,
-			KeepAlive: 30 * time.Second,
+			Logger: config.Logger,
 			Capabilities: &mcp.ServerCapabilities{
 				Tools: &mcp.ToolCapabilities{ListChanged: false},
 			},
 		},
 	)
+	server.AddReceivingMiddleware(resultPolicyMiddleware)
 
 	for _, item := range config.Registry.Visible(principal) {
 		registerTool(server, config.Engine, item, principal)
@@ -225,7 +245,6 @@ func adaptAuthenticator(authenticator identity.Authenticator, config Config) mcp
 		return &mcpauth.TokenInfo{
 			Scopes:     append([]string(nil), authentication.Principal.Scopes...),
 			Expiration: authentication.ExpiresAt,
-			UserID:     authentication.SessionBindingID,
 			Extra: map[string]any{
 				principalExtraKey: authentication.Principal,
 			},
@@ -406,22 +425,113 @@ func requestContextMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// originMiddleware 拒绝未加入白名单的浏览器跨域请求。
-func originMiddleware(allowed []string, next http.Handler) http.Handler {
-	allowedSet := make(map[string]struct{}, len(allowed))
+// newCrossOriginProtection 创建标准跨域请求保护器。
+func newCrossOriginProtection(allowed []string) (*http.CrossOriginProtection, error) {
+	protection := http.NewCrossOriginProtection()
 	for _, origin := range allowed {
-		allowedSet[origin] = struct{}{}
+		if err := protection.AddTrustedOrigin(origin); err != nil {
+			return nil, fmt.Errorf("允许的 Origin %q 无效：%w", origin, err)
+		}
 	}
+	return protection, nil
+}
+
+// protocolMiddleware 只允许 MCP 2026-07-28 无状态请求。
+func protocolMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		origin := request.Header.Get("Origin")
-		if origin != "" {
-			if _, ok := allowedSet[origin]; !ok {
-				http.Error(writer, "origin forbidden", http.StatusForbidden)
+		if request.Method != http.MethodPost {
+			writer.Header().Set("Allow", http.MethodPost)
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if len(request.Header.Values("Mcp-Session-Id")) > 0 ||
+			len(request.Header.Values("Last-Event-ID")) > 0 {
+			writeProtocolError(writer, -32600, "legacy session headers are not supported", nil)
+			return
+		}
+		versions := request.Header.Values("Mcp-Protocol-Version")
+		if len(versions) != 1 || versions[0] != protocolVersion {
+			requested := ""
+			if len(versions) == 1 {
+				requested = versions[0]
+			}
+			writeProtocolError(writer, mcp.CodeUnsupportedProtocolVersion, "Unsupported protocol version", map[string]any{
+				"supported": []string{protocolVersion},
+				"requested": requested,
+			})
+			return
+		}
+		methods := request.Header.Values("Mcp-Method")
+		if len(methods) != 1 || !validHTTPValue(methods[0], 256) {
+			writeProtocolError(writer, -32600, "Mcp-Method header is required", nil)
+			return
+		}
+		if removedProtocolMethod(methods[0]) {
+			writeProtocolError(writer, -32601, "Method not found", nil)
+			return
+		}
+		if methods[0] == "tools/call" {
+			names := request.Header.Values("Mcp-Name")
+			if len(names) != 1 || !validHTTPValue(names[0], 128) {
+				writeProtocolError(writer, -32600, "Mcp-Name header is required", nil)
 				return
 			}
 		}
 		next.ServeHTTP(writer, request)
 	})
+}
+
+// removedProtocolMethod 判断请求是否属于新版已经删除的协议方法。
+func removedProtocolMethod(method string) bool {
+	switch method {
+	case "initialize",
+		"notifications/initialized",
+		"ping",
+		"logging/setLevel",
+		"resources/subscribe",
+		"resources/unsubscribe":
+		return true
+	default:
+		return false
+	}
+}
+
+// writeProtocolError 返回不包含内部信息的 JSON-RPC 协议错误。
+func writeProtocolError(writer http.ResponseWriter, code int64, message string, data any) {
+	response := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      nil,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	}
+	if data != nil {
+		response["error"].(map[string]any)["data"] = data
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(writer).Encode(response)
+}
+
+// resultPolicyMiddleware 固定协议版本和缓存范围。
+func resultPolicyMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, request mcp.Request) (mcp.Result, error) {
+		result, err := next(ctx, method, request)
+		if err != nil {
+			return result, err
+		}
+		switch current := result.(type) {
+		case *mcp.DiscoverResult:
+			current.SupportedVersions = []string{protocolVersion}
+			current.CacheScope = "public"
+			current.TTLMs = 0
+		case *mcp.ListToolsResult:
+			current.CacheScope = "private"
+			current.TTLMs = 0
+		}
+		return result, nil
+	}
 }
 
 // contextString 从上下文读取字符串。

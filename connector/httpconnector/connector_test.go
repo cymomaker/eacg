@@ -1,3 +1,4 @@
+// 本文件验证 HTTP Connector 的调用和安全限制。
 package httpconnector
 
 import (

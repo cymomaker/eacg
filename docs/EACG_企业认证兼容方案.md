@@ -1,184 +1,117 @@
 # EACG 企业认证兼容方案
 
-## 1. 这套认证解决什么问题
+## 1. 两种 API Key 使用方式
 
-企业微信智能机器人配置 MCP 插件时，可以填写固定的 Service Token 或 API Key。这个固定值只能说明“请求来自哪个机器人或应用”，不能说明“当前是哪位员工在提问”。
-
-EACG 因此把身份分成两层：
+### 服务身份
 
 ```text
-API Key                 → 调用应用身份
-requester userid Header → 实际用户身份
+API Key → Tenant + Client + Roles/Scopes → Service Principal
 ```
 
-只有两层都验证成功，EACG 才创建完整的 `Principal` 并处理 MCP 请求。
+适用于内部服务、定时任务、机器人后台和其他机器到机器调用。只需要 API Key，不要求 userid。
 
-## 2. 各组件负责什么
-
-### EACG 核心
-
-EACG 提供通用组件：
-
-- `Authenticator`：统一认证入口；
-- `APIKeyStore`：按摘要查询 API Key；
-- `SubjectResolver`：把外部 userid 映射为企业内部用户；
-- API Key 最大权限和用户实际权限取交集；
-- MCP Session 与应用、用户和权限版本绑定；
-- JWT 兼容适配器。
-
-EACG 不提供 API Key 的生成、发放后台，也不理解企业微信组织架构。
-
-### 企业业务系统
-
-业务系统负责实现生产版本的 `APIKeyStore` 和 `SubjectResolver`：
-
-- 从数据库或密钥服务读取 API Key 状态；
-- 把企业微信 userid 映射为内部 User ID；
-- 查询用户角色、Scope、数据权限和停用状态；
-- 返回权限版本，保证权限变化后旧 Session 失效。
-
-### 企业微信
-
-企业微信在每个 MCP 请求中发送：
-
-```http
-X-EACG-API-Key: <固定服务密钥>
-X-EACG-Requester-UserID: <当前提问者>
-```
-
-Header 名称只是本地示例值。生产环境通过环境变量配置实际名称，不需要修改 EACG 源码。
-
-## 3. 一次请求怎样完成认证
+### 代理用户身份
 
 ```text
-1. MCP HTTP 请求到达 /mcp
-2. 读取自定义 API Key Header
-3. 拒绝同时出现的 Authorization Header
-4. 将 API Key 转成 MCP SDK 内部使用的 Bearer 形式
-5. 读取 requester userid Header
-6. 对 API Key 计算 SHA-256 摘要
-7. APIKeyStore 查询服务身份、租户和最大权限
-8. SubjectResolver 查询实际用户和用户权限
-9. Roles、Scopes 分别取交集
-10. 生成 Principal 和 SessionBindingID
-11. MCP SDK 处理 initialize、tools/list 或 tools/call
+API Key → 调用应用
+requester userid → 实际用户
+业务用户目录 → 用户权限
+自定义 Authenticator → User Principal
 ```
 
-`TenantID`、`ClientID` 和 `AgentID` 只能来自 API Key 记录。请求方不能通过 Header 自行指定租户或应用身份。
+适用于企业微信等“应用代表用户操作”的场景。userid 不是 API Key 的组成部分，其真实性和业务映射由接入方负责。
 
-## 4. 为什么权限要取交集
+## 2. EACG 与业务职责
 
-假设机器人最多允许读取资料：
+EACG 核心负责：
+
+- 通用 `Authenticator` 和 `Principal`；
+- API Key 摘要校验及服务身份；
+- 可选 Subject Header 安全读取；
+- 身份类型、角色授权和审计。
+
+业务系统负责：
+
+- 外部 userid 到企业用户的映射；
+- 用户状态、租户和数据权限检查；
+- 应用权限与用户权限的合并；
+- 企业微信、钉钉等平台专用认证逻辑。
+
+## 3. HTTP 配置
+
+纯服务 API Key：
+
+```go
+eacg.HTTPAuthenticationConfig{
+    Authenticator:    apiKeyAuthenticator,
+    CredentialHeader: "X-EACG-API-Key",
+}
+```
+
+业务自定义代理用户认证：
+
+```go
+eacg.HTTPAuthenticationConfig{
+    Authenticator:    weComAuthenticator,
+    CredentialHeader: "X-EACG-API-Key",
+    SubjectHeader:    "X-EACG-Requester-UserID",
+    SubjectProvider:  "wecom",
+}
+```
+
+未配置 `SubjectHeader` 时，EACG 不要求 userid，并向 Authenticator 传入 `Subject=nil`。配置后，Header 必须存在且只能出现一次。
+
+## 4. API Key Store
+
+```go
+type APIKeyStore interface {
+    LookupByDigest(context.Context, [32]byte) (APIKeyRecord, error)
+}
+```
+
+生产 Store 可以查询数据库或使用支持主动失效的安全缓存。EACG 只传入 SHA-256 摘要，不保存和记录明文 Key。
+
+API Key 记录中的 TenantID、ClientID、AgentID、Roles 和 Scopes 是可信服务身份，不能被 HTTP Header 或 Tool 参数覆盖。
+
+## 5. 企业微信接入
+
+插件配置：
 
 ```text
-API Key Roles = [reader]
+授权方式：Service token / API key
+位置：Header
+Parameter name：X-EACG-API-Key
+传输协议：Streamable HTTP
 ```
 
-某位员工拥有：
+如果 Tool 只使用机器人服务权限，不需要 requester userid。
+
+如果 Tool 必须识别实际用户：
+
+- 业务项目实现自定义 Authenticator；
+- 入口网关删除外部请求自带的 userid Header；
+- 可信企业微信链路重新注入 userid；
+- 无法保证 Header 来源时增加 mTLS、来源限制或签名验证；
+- 返回 `SubjectUser` Principal，并为 Tool 声明 `IdentityUser`。
+
+## 6. Capability 授权
 
 ```text
-User Roles = [reader, admin]
+IdentityAny     → 用户和服务都可调用
+IdentityUser    → 必须有真实用户
+IdentityService → 必须是系统服务
 ```
 
-最终权限是：
+Registry 在 `tools/list` 阶段按身份类型和角色裁剪；Execution Engine 在 `tools/call` 阶段再次校验。
 
-```text
-Effective Roles = [reader]
-```
+## 7. 生产安全要求
 
-机器人不能借用管理员的全部权限，用户也不能借用机器人拥有但自己没有的权限。任何一侧权限列表为空，最终都没有权限。
-
-## 5. Session 怎样绑定身份
-
-EACG 使用以下信息生成 SHA-256 会话绑定标识：
-
-- Tenant ID；
-- Client ID；
-- Agent ID；
-- User ID；
-- Credential ID；
-- API Key 版本；
-- 用户权限版本；
-- 最终 Roles 和 Scopes。
-
-MCP SDK 在 Session 创建时保存这个标识。后续请求如果更换用户、Key 或权限版本，将返回 `403 session user mismatch`，客户端需要重新执行初始化。
-
-API Key 和 `Mcp-Session-Id` 不能互相替代：
-
-- API Key 证明调用应用身份；
-- requester userid 表示实际用户；
-- Session ID 表示一段 MCP 协议会话。
-
-## 6. 示例配置
-
-启动本地 API Key 示例：
-
-```bash
-make run-api-key
-```
-
-等价环境变量如下：
-
-```bash
-export EACG_AUTH_MODE=api_key
-export EACG_API_KEY=0123456789abcdef0123456789abcdef
-export EACG_API_KEY_ID=wecom-demo-key
-export EACG_TENANT_ID=tenant-a
-export EACG_CLIENT_ID=wecom-bot
-export EACG_CREDENTIAL_HEADER=X-EACG-API-Key
-export EACG_REQUESTER_USER_HEADER=X-EACG-Requester-UserID
-export EACG_SUBJECT_PROVIDER=wecom
-go run ./cmd/eacg-example
-```
-
-`EACG_API_KEY_EXPIRES_AT` 可以填写 RFC3339 时间，例如：
-
-```text
-2026-12-31T23:59:59+08:00
-```
-
-未配置 Key 过期时间时，每次认证结果使用 5 分钟租约，但每个 HTTP 请求仍会重新查询 Key 和用户状态。
-
-完整 curl 时序见项目 `README.md`。
-
-## 7. 生产环境接入要求
-
-### Key Store
-
-生产实现只保存高强度随机 API Key 的 SHA-256 摘要，不保存明文。每条记录至少包括：
-
-- 凭据 ID；
-- 租户和应用身份；
-- 允许的用户来源；
-- 最大 Roles 和 Scopes；
-- 启用状态；
-- 版本；
-- 可选过期时间。
-
-轮换时可以同时保留新旧两个 Key，客户端切换完成后停用旧 Key。停用后，旧 Key 的下一次请求立即认证失败。
-
-### 用户目录
-
-生产 `SubjectResolver` 应查询企业 IAM、组织目录或 RBAC 服务。不要使用示例中“外部 userid 直接作为内部 User ID”的实现。
-
-### Header 信任
-
-requester userid Header 本身不是密码，也不是用户签名。生产入口必须：
-
-- 使用 HTTPS；
-- 删除公网客户端自行传入的同名 Header；
-- 只允许可信企业微信链路或网关注入该 Header；
-- 条件允许时增加 mTLS、来源网络限制或请求签名。
-
-如果攻击者同时获得 API Key 并能伪造 userid Header，这种认证方式无法证明真实用户身份。
-
-## 8. 常见错误
-
-| HTTP 状态 | 含义 |
-| --- | --- |
-| `401` | API Key、userid 或身份映射无效 |
-| `403` | 当前请求身份与已有 MCP Session 不一致 |
-| `404` | Session 不存在、过期或已关闭 |
-| `500` | Key Store 或用户目录暂时不可用 |
-
-认证失败日志只包含 Request ID 和稳定错误码，不记录 API Key、完整 userid 或请求正文。
+- 外部只使用 HTTPS；
+- Key 由企业密钥系统生成、轮换和吊销；
+- Key Store 只保存摘要；
+- 每个 MCP 请求重新认证；
+- 自定义 Key Header 与 Authorization 冲突时拒绝；
+- Query 中的凭据不生效；
+- 日志只记录 CredentialID，不记录明文；
+- 服务身份审计的 UserID 为空，保留 Tenant、Client、Agent 和 SubjectType；
+- 代理用户 Header 不可信时，不能把它当作强用户认证。

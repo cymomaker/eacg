@@ -1,3 +1,4 @@
+// 本文件验证执行管线的授权、输出保护和审计。
 package execution
 
 import (
@@ -12,10 +13,12 @@ import (
 	"github.com/cymomaker/eacg/registry"
 )
 
+// accountInput 保存账户查询测试的输入。
 type accountInput struct {
 	ID string `json:"id"`
 }
 
+// accountOutput 保存账户查询测试的输出。
 type accountOutput struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
@@ -59,6 +62,7 @@ func TestEngineExecute(t *testing.T) {
 	engine, sink := newTestEngine(t)
 	result, err := engine.Execute(context.Background(), Request{
 		Principal: identity.Principal{
+			SubjectType:     identity.SubjectUser,
 			TenantID:        "tenant-a",
 			UserID:          "user-1",
 			AuthMethod:      "api_key",
@@ -85,8 +89,97 @@ func TestEngineExecute(t *testing.T) {
 	}
 	if events[0].AuthMethod != "api_key" ||
 		events[0].CredentialID != "key-1" ||
-		events[0].SubjectProvider != "wecom" {
+		events[0].SubjectProvider != "wecom" ||
+		events[0].SubjectType != string(identity.SubjectUser) {
 		t.Fatalf("审计认证身份不正确：%+v", events[0])
+	}
+}
+
+// TestEngineRejectsServiceCallingUserCapability 验证服务身份不能绕过用户 Tool 限制。
+func TestEngineRejectsServiceCallingUserCapability(t *testing.T) {
+	t.Parallel()
+
+	store := registry.New()
+	item, err := capability.New(capability.Descriptor{
+		ID:                  "user_only.v1",
+		Name:                "user_only",
+		Version:             "v1",
+		Description:         "仅允许用户调用",
+		RiskLevel:           capability.RiskR1,
+		ReadOnly:            true,
+		IdentityRequirement: capability.IdentityUser,
+		RequiredRoles:       []string{"reader"},
+	}, func(_ context.Context, _ capability.RequestContext, input accountInput) (accountOutput, error) {
+		return accountOutput{ID: input.ID}, nil
+	})
+	if err != nil {
+		t.Fatalf("创建用户能力失败：%v", err)
+	}
+	if err := store.Register(item); err != nil {
+		t.Fatalf("注册用户能力失败：%v", err)
+	}
+	sink := new(audit.MemorySink)
+	engine, err := New(store, sink, Config{})
+	if err != nil {
+		t.Fatalf("创建执行引擎失败：%v", err)
+	}
+	_, err = engine.Execute(context.Background(), Request{
+		Principal: identity.Principal{
+			SubjectType:  identity.SubjectService,
+			TenantID:     "tenant-a",
+			ClientID:     "service-a",
+			AuthMethod:   "api_key",
+			CredentialID: "key-1",
+			Roles:        []string{"reader"},
+		},
+		Capability: "user_only",
+		Arguments:  json.RawMessage(`{"id":"42"}`),
+	})
+	if !errors.Is(err, ErrForbidden) {
+		t.Fatalf("服务调用用户能力应返回 ErrForbidden，实际为：%v", err)
+	}
+	events := sink.Events()
+	if len(events) != 1 ||
+		events[0].SubjectType != string(identity.SubjectService) ||
+		events[0].UserID != "" ||
+		events[0].ClientID != "service-a" ||
+		events[0].Allowed {
+		t.Fatalf("服务身份审计不正确：%+v", events)
+	}
+}
+
+// TestEngineExecutesAndAuditsServiceIdentity 验证通用 Tool 可由服务调用并正确审计。
+func TestEngineExecutesAndAuditsServiceIdentity(t *testing.T) {
+	t.Parallel()
+
+	engine, sink := newTestEngine(t)
+	_, err := engine.Execute(context.Background(), Request{
+		Principal: identity.Principal{
+			SubjectType:  identity.SubjectService,
+			TenantID:     "tenant-a",
+			ClientID:     "service-a",
+			AgentID:      "agent-a",
+			AuthMethod:   "api_key",
+			CredentialID: "key-1",
+			Roles:        []string{"reader"},
+		},
+		Capability: "get_account",
+		Arguments:  json.RawMessage(`{"id":"42"}`),
+	})
+	if err != nil {
+		t.Fatalf("服务身份执行通用能力失败：%v", err)
+	}
+	events := sink.Events()
+	if len(events) != 1 ||
+		!events[0].Allowed ||
+		!events[0].Success ||
+		events[0].SubjectType != string(identity.SubjectService) ||
+		events[0].TenantID != "tenant-a" ||
+		events[0].ClientID != "service-a" ||
+		events[0].AgentID != "agent-a" ||
+		events[0].CredentialID != "key-1" ||
+		events[0].UserID != "" {
+		t.Fatalf("服务身份成功审计不正确：%+v", events)
 	}
 }
 
@@ -96,7 +189,11 @@ func TestEngineRejectsUnauthorizedCall(t *testing.T) {
 
 	engine, sink := newTestEngine(t)
 	_, err := engine.Execute(context.Background(), Request{
-		Principal:  identity.Principal{TenantID: "tenant-a", UserID: "user-1"},
+		Principal: identity.Principal{
+			SubjectType: identity.SubjectUser,
+			TenantID:    "tenant-a",
+			UserID:      "user-1",
+		},
 		Capability: "get_account",
 		Arguments:  json.RawMessage(`{"id":"42"}`),
 	})

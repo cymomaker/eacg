@@ -1,3 +1,4 @@
+// 本文件实现 HMAC JWT 认证。
 package identity
 
 import (
@@ -73,6 +74,7 @@ func (a *JWTAuthenticator) Authenticate(
 	}
 
 	principal := Principal{
+		SubjectType:  SubjectUser,
 		TenantID:     claims.TenantID,
 		UserID:       claims.Subject,
 		AgentID:      claims.AgentID,
@@ -86,23 +88,9 @@ func (a *JWTAuthenticator) Authenticate(
 	if !principal.Valid() {
 		return Authentication{}, ErrUnauthenticated
 	}
-	bindingID, err := buildSessionBinding(sessionBindingInput{
-		TenantID:     principal.TenantID,
-		ClientID:     principal.ClientID,
-		AgentID:      principal.AgentID,
-		UserID:       principal.UserID,
-		CredentialID: principal.CredentialID,
-		Roles:        principal.Roles,
-		Scopes:       principal.Scopes,
-	})
-	if err != nil {
-		return Authentication{}, fmt.Errorf("生成 JWT 会话绑定标识：%w", err)
-	}
 	return Authentication{
-		Principal:        principal,
-		CredentialID:     principal.CredentialID,
-		SessionBindingID: bindingID,
-		ExpiresAt:        claims.ExpiresAt.Time,
+		Principal: principal,
+		ExpiresAt: claims.ExpiresAt.Time,
 	}, nil
 }
 

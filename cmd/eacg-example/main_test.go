@@ -1,3 +1,4 @@
+// 本文件验证示例应用的 JWT 和 API Key 配置。
 package main
 
 import (
@@ -22,7 +23,7 @@ func TestNewAuthenticationJWT(t *testing.T) {
 	}
 }
 
-// TestNewAuthenticationAPIKey 验证示例创建可用的 API Key 复合认证配置。
+// TestNewAuthenticationAPIKey 验证示例创建纯服务 API Key 认证配置。
 func TestNewAuthenticationAPIKey(t *testing.T) {
 	rawKey := "0123456789abcdef0123456789abcdef"
 	t.Setenv("EACG_AUTH_MODE", "api_key")
@@ -36,16 +37,14 @@ func TestNewAuthenticationAPIKey(t *testing.T) {
 		context.Background(),
 		identity.AuthenticationRequest{
 			Credential: rawKey,
-			Subject: &identity.SubjectAssertion{
-				Provider:   authentication.SubjectProvider,
-				ExternalID: "zhangsan",
-			},
 		},
 	)
 	if err != nil {
 		t.Fatalf("API Key 示例认证失败：%v", err)
 	}
-	if result.Principal.UserID != "zhangsan" ||
+	if result.Principal.SubjectType != identity.SubjectService ||
+		result.Principal.ClientID != "eacg-service" ||
+		result.Principal.UserID != "" ||
 		!result.Principal.HasRole("reader") {
 		t.Fatalf("API Key 示例身份不正确：%+v", result.Principal)
 	}

@@ -90,7 +90,9 @@ func (r *Registry) Visible(principal identity.Principal) []capability.Capability
 
 	result := make([]capability.Capability, 0, len(r.ordered))
 	for _, item := range r.ordered {
-		if principal.HasAllRoles(item.Descriptor().RequiredRoles) {
+		descriptor := item.Descriptor()
+		if descriptor.AllowsPrincipal(principal) &&
+			principal.HasAllRoles(descriptor.RequiredRoles) {
 			result = append(result, item)
 		}
 	}

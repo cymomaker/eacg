@@ -22,15 +22,15 @@ import (
 
 // Config 定义 EACG 应用参数。
 type Config struct {
-	Name              string
-	Version           string
-	Address           string
-	ReadHeaderTimeout time.Duration
-	ShutdownTimeout   time.Duration
-	SessionTimeout    time.Duration
-	ExecutionTimeout  time.Duration
-	AllowedOrigins    []string
-	ResourceMetaURL   string
+	Name                string
+	Version             string
+	Address             string
+	ReadHeaderTimeout   time.Duration
+	ShutdownTimeout     time.Duration
+	ExecutionTimeout    time.Duration
+	MaxRequestBodyBytes int64
+	AllowedOrigins      []string
+	ResourceMetaURL     string
 }
 
 // HTTPAuthenticationConfig 定义 MCP HTTP 端点的认证方式。
@@ -122,18 +122,18 @@ func (a *App) Handler() (http.Handler, error) {
 		return nil, err
 	}
 	mcpHandler, err := mcphttp.New(mcphttp.Config{
-		Name:             a.config.Name,
-		Version:          a.config.Version,
-		Registry:         a.registry,
-		Engine:           engine,
-		Authenticator:    a.authentication.Authenticator,
-		CredentialHeader: a.authentication.CredentialHeader,
-		SubjectHeader:    a.authentication.SubjectHeader,
-		SubjectProvider:  a.authentication.SubjectProvider,
-		Logger:           a.logger,
-		SessionTimeout:   a.config.SessionTimeout,
-		AllowedOrigins:   a.config.AllowedOrigins,
-		ResourceMetaURL:  a.config.ResourceMetaURL,
+		Name:                a.config.Name,
+		Version:             a.config.Version,
+		Registry:            a.registry,
+		Engine:              engine,
+		Authenticator:       a.authentication.Authenticator,
+		CredentialHeader:    a.authentication.CredentialHeader,
+		SubjectHeader:       a.authentication.SubjectHeader,
+		SubjectProvider:     a.authentication.SubjectProvider,
+		Logger:              a.logger,
+		MaxRequestBodyBytes: a.config.MaxRequestBodyBytes,
+		AllowedOrigins:      a.config.AllowedOrigins,
+		ResourceMetaURL:     a.config.ResourceMetaURL,
 	})
 	if err != nil {
 		return nil, err

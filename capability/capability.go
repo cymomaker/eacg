@@ -23,6 +23,7 @@ var ErrInvalidOutput = errors.New("能力输出无效")
 // RiskLevel 表示能力风险等级。
 type RiskLevel string
 
+// 风险等级用于限制 Capability 可以执行的操作。
 const (
 	// RiskR0 表示公共只读能力。
 	RiskR0 RiskLevel = "R0"
@@ -34,6 +35,20 @@ const (
 	RiskR3 RiskLevel = "R3"
 )
 
+// IdentityRequirement 表示能力允许哪类身份调用。
+type IdentityRequirement string
+
+// 身份要求用于限制用户或服务调用能力。
+const (
+	// IdentityAny 表示用户和服务身份都可以调用。
+	IdentityAny IdentityRequirement = "any"
+	// IdentityUser 表示只有真实用户可以调用。
+	IdentityUser IdentityRequirement = "user"
+	// IdentityService 表示只有系统服务可以调用。
+	IdentityService IdentityRequirement = "service"
+)
+
+// toolNamePattern 限制 Tool 名称为安全的协议字符。
 var toolNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // Descriptor 描述一个可对 Agent 开放的企业能力。
@@ -45,6 +60,7 @@ type Descriptor struct {
 	RiskLevel           RiskLevel
 	ReadOnly            bool
 	Idempotent          bool
+	IdentityRequirement IdentityRequirement
 	RequiredRoles       []string
 	AllowedOutputFields []string
 	InputSchema         *jsonschema.Schema
@@ -65,10 +81,27 @@ func (d Descriptor) Validate() error {
 	if !d.ReadOnly {
 		return fmt.Errorf("MVP 只允许只读能力")
 	}
+	if normalizedIdentityRequirement(d.IdentityRequirement) == "" {
+		return fmt.Errorf("身份要求只支持 any、user 或 service")
+	}
 	if d.InputSchema == nil || d.OutputSchema == nil {
 		return fmt.Errorf("输入和输出 Schema 不能为空")
 	}
 	return nil
+}
+
+// AllowsPrincipal 检查身份类型是否满足能力要求。
+func (d Descriptor) AllowsPrincipal(principal identity.Principal) bool {
+	switch normalizedIdentityRequirement(d.IdentityRequirement) {
+	case IdentityAny:
+		return principal.Valid()
+	case IdentityUser:
+		return principal.IsUser()
+	case IdentityService:
+		return principal.IsService()
+	default:
+		return false
+	}
 }
 
 // RequestContext 保存能力处理函数需要的调用上下文。
@@ -124,6 +157,9 @@ func New[I, O any](descriptor Descriptor, handler Handler[I, O]) (Capability, er
 	}
 	descriptor.InputSchema = inputSchema
 	descriptor.OutputSchema = outputSchema
+	if descriptor.IdentityRequirement == "" {
+		descriptor.IdentityRequirement = IdentityAny
+	}
 	if err := descriptor.Validate(); err != nil {
 		return nil, err
 	}
@@ -143,6 +179,19 @@ func New[I, O any](descriptor Descriptor, handler Handler[I, O]) (Capability, er
 		inputResolved:  inputResolved,
 		outputResolved: outputResolved,
 	}, nil
+}
+
+// normalizedIdentityRequirement 把空身份要求转换为默认的 any。
+func normalizedIdentityRequirement(value IdentityRequirement) IdentityRequirement {
+	if value == "" {
+		return IdentityAny
+	}
+	switch value {
+	case IdentityAny, IdentityUser, IdentityService:
+		return value
+	default:
+		return ""
+	}
 }
 
 // Descriptor 返回不可直接修改的能力描述副本。

@@ -1,46 +1,34 @@
 # Security Policy
 
-## Supported Versions
-
-当前安全修复支持范围：
+## 支持版本
 
 | Version | Supported |
 | --- | --- |
-| `0.1.x` | Yes |
-| `< 0.1.0` | No |
+| `0.2.x` | Yes |
+| `< 0.2.0` | No |
 
-## Reporting a Vulnerability
+## 安全边界
 
-请优先通过 GitHub 仓库 Security 页面提交私密安全报告：
+生产环境必须满足：
+
+- 外部流量使用 HTTPS；
+- API Key、JWT Secret 由企业密钥系统生成、保存和轮换；
+- 内置 API Key 服务认证不要求 requester userid；
+- 业务启用代理用户认证时，requester userid Header 只能由可信网关注入；
+- 每个 MCP 请求都经过认证和授权；
+- 业务 `APIKeyStore` 正确处理停用、过期和权限变化；
+- 自定义用户 Authenticator 负责用户状态、租户和权限校验；
+- 数据库账号遵循最小权限原则；
+- 日志和审计不得记录明文凭据、完整请求正文和内部数据库错误。
+
+EACG `v0.2.x` 不保存 MCP 协议会话。多实例部署可以直接负载均衡，不需要会话粘滞。
+
+## 漏洞报告
+
+请通过 GitHub Security 页面提交私密报告：
 
 ```text
 https://github.com/cymomaker/eacg/security
 ```
 
-安全报告请包含：
-
-- 受影响版本；
-- 问题类型和影响范围；
-- 最小复现步骤；
-- 建议修复方式；
-- 是否已经公开披露。
-
-不要在公开 Issue 中提交以下内容：
-
-- API Key、JWT 或其他真实凭据；
-- 企业 userid、租户信息或业务数据；
-- 可直接利用的完整攻击脚本；
-- 尚未修复漏洞的敏感部署信息。
-
-维护者确认问题后，应先完成影响评估和修复，再协调披露时间。
-
-## Security Boundaries
-
-EACG `v0.1.x` 的生产使用方必须自行保证：
-
-- 外部流量使用 HTTPS；
-- requester userid Header 只能由可信网关注入；
-- JWT Secret 和 API Key 由企业密钥系统管理；
-- 示例默认密钥不进入生产环境；
-- 多实例部署使用会话粘滞；
-- 业务 `APIKeyStore` 和 `SubjectResolver` 正确处理停用、过期和权限版本。
+报告应包含受影响版本、影响范围、最小复现步骤和建议修复方式。不要在公开 Issue 中提交真实凭据、企业用户信息或尚未修复漏洞的利用代码。

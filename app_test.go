@@ -1,3 +1,4 @@
+// 本文件验证 EACG 应用组装、无状态调用和请求取消。
 package eacg
 
 import (
@@ -5,7 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,8 +16,24 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// staticAuthenticator 为应用测试返回固定身份。
 type staticAuthenticator struct {
 	principal identity.Principal
+}
+
+// countingAuthenticator 统计每次 HTTP 请求触发的认证次数。
+type countingAuthenticator struct {
+	delegate staticAuthenticator
+	calls    atomic.Int64
+}
+
+// Authenticate 统计认证次数并返回固定身份。
+func (a *countingAuthenticator) Authenticate(
+	ctx context.Context,
+	request identity.AuthenticationRequest,
+) (identity.Authentication, error) {
+	a.calls.Add(1)
+	return a.delegate.Authenticate(ctx, request)
 }
 
 // Authenticate 为应用测试返回固定身份。
@@ -26,58 +43,43 @@ func (a staticAuthenticator) Authenticate(
 ) (identity.Authentication, error) {
 	principal := a.principal
 	if !principal.Valid() {
-		principal = identity.Principal{TenantID: "tenant-a", UserID: "user-1"}
+		principal = identity.Principal{
+			SubjectType:  identity.SubjectUser,
+			TenantID:     "tenant-a",
+			UserID:       "user-1",
+			AuthMethod:   "bearer",
+			CredentialID: "test-credential",
+		}
+	}
+	if principal.AuthMethod == "" {
+		principal.AuthMethod = "bearer"
+	}
+	if principal.CredentialID == "" {
+		principal.CredentialID = "test-credential"
 	}
 	return identity.Authentication{
-		Principal:        principal,
-		CredentialID:     "test-credential",
-		SessionBindingID: principal.TenantID + ":" + principal.UserID,
-		ExpiresAt:        time.Now().Add(time.Hour),
+		Principal: principal,
+		ExpiresAt: time.Now().Add(time.Hour),
 	}, nil
 }
 
+// bearerTransport 为测试请求增加 Bearer Token。
 type bearerTransport struct {
 	base  http.RoundTripper
 	token string
 }
 
+// apiKeyTransport 为测试请求增加 API Key。
 type apiKeyTransport struct {
 	base http.RoundTripper
 	key  string
-	mu   sync.RWMutex
-	user string
 }
 
-// RoundTrip 为 MCP 请求增加固定 API Key 和当前用户 Header。
+// RoundTrip 为 MCP 请求增加固定 API Key Header。
 func (t *apiKeyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	t.mu.RLock()
-	user := t.user
-	t.mu.RUnlock()
 	cloned := request.Clone(request.Context())
 	cloned.Header.Set("X-EACG-API-Key", t.key)
-	cloned.Header.Set("X-EACG-Requester-UserID", user)
 	return t.base.RoundTrip(cloned)
-}
-
-// SetUser 修改后续请求携带的外部用户标识。
-func (t *apiKeyTransport) SetUser(user string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.user = user
-}
-
-type appSubjectResolver struct{}
-
-// Resolve 为应用集成测试映射企业用户。
-func (appSubjectResolver) Resolve(
-	_ context.Context,
-	request identity.SubjectResolveRequest,
-) (identity.Subject, error) {
-	return identity.Subject{
-		UserID:            request.ExternalID,
-		Roles:             []string{"reader"},
-		PermissionVersion: "p1",
-	}, nil
 }
 
 // RoundTrip 为 MCP 测试请求增加 Bearer Token。
@@ -87,12 +89,46 @@ func (t bearerTransport) RoundTrip(request *http.Request) (*http.Response, error
 	return t.base.RoundTrip(cloned)
 }
 
+// echoInput 保存回显 Tool 的输入。
 type echoInput struct {
 	Message string `json:"message"`
 }
 
+// echoOutput 保存回显 Tool 的输出。
 type echoOutput struct {
 	Message string `json:"message"`
+}
+
+// alternatingHandler 模拟多个无共享状态的服务实例。
+type alternatingHandler struct {
+	handlers []http.Handler
+	next     atomic.Uint64
+}
+
+// ServeHTTP 把相邻请求轮流交给不同的无状态 Handler。
+func (h *alternatingHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	index := h.next.Add(1) - 1
+	h.handlers[index%uint64(len(h.handlers))].ServeHTTP(writer, request)
+}
+
+// newEchoTestCapability 创建应用测试共用的回显能力。
+func newEchoTestCapability(t *testing.T) capability.Capability {
+	t.Helper()
+	item, err := capability.New(capability.Descriptor{
+		ID:            "echo.v1",
+		Name:          "echo",
+		Version:       "v1",
+		Description:   "返回输入文本",
+		RiskLevel:     capability.RiskR0,
+		ReadOnly:      true,
+		RequiredRoles: []string{"reader"},
+	}, func(_ context.Context, _ capability.RequestContext, input echoInput) (echoOutput, error) {
+		return echoOutput(input), nil
+	})
+	if err != nil {
+		t.Fatalf("创建能力失败：%v", err)
+	}
+	return item
 }
 
 // TestAppHealthAndReadiness 验证健康检查和就绪检查。
@@ -125,37 +161,29 @@ func TestAppHealthAndReadiness(t *testing.T) {
 func TestAppMCPFlow(t *testing.T) {
 	t.Parallel()
 
+	authenticator := &countingAuthenticator{
+		delegate: staticAuthenticator{
+			principal: identity.Principal{
+				SubjectType:  identity.SubjectUser,
+				TenantID:     "tenant-a",
+				UserID:       "user-1",
+				AuthMethod:   "bearer",
+				CredentialID: "test-credential",
+				Roles:        []string{"reader"},
+			},
+		},
+	}
 	app, err := New(
 		Config{Name: "test", Version: "v1"},
 		HTTPAuthenticationConfig{
-			Authenticator: staticAuthenticator{
-				principal: identity.Principal{
-					TenantID: "tenant-a",
-					UserID:   "user-1",
-					Roles:    []string{"reader"},
-				},
-			},
+			Authenticator: authenticator,
 		},
 		new(audit.MemorySink),
 	)
 	if err != nil {
 		t.Fatalf("创建应用失败：%v", err)
 	}
-	echo, err := capability.New(capability.Descriptor{
-		ID:            "echo.v1",
-		Name:          "echo",
-		Version:       "v1",
-		Description:   "返回输入文本",
-		RiskLevel:     capability.RiskR0,
-		ReadOnly:      true,
-		RequiredRoles: []string{"reader"},
-	}, func(_ context.Context, _ capability.RequestContext, input echoInput) (echoOutput, error) {
-		return echoOutput(input), nil
-	})
-	if err != nil {
-		t.Fatalf("创建能力失败：%v", err)
-	}
-	if err := app.RegisterCapability(echo); err != nil {
+	if err := app.RegisterCapability(newEchoTestCapability(t)); err != nil {
 		t.Fatalf("注册能力失败：%v", err)
 	}
 	handler, err := app.Handler()
@@ -200,6 +228,142 @@ func TestAppMCPFlow(t *testing.T) {
 	if string(raw) != `{"message":"hello"}` {
 		t.Fatalf("Tool 结果不正确：%s", raw)
 	}
+	if authenticator.calls.Load() < 3 {
+		t.Fatalf("发现、列表和调用必须分别认证，实际次数：%d", authenticator.calls.Load())
+	}
+}
+
+// TestAppMCPFlowAcrossHandlers 验证不同实例可以轮流处理同一个逻辑调用流程。
+func TestAppMCPFlowAcrossHandlers(t *testing.T) {
+	t.Parallel()
+
+	var handlers []http.Handler
+	for range 2 {
+		app, err := New(
+			Config{Name: "test", Version: "v1"},
+			HTTPAuthenticationConfig{Authenticator: staticAuthenticator{
+				principal: identity.Principal{
+					SubjectType:  identity.SubjectUser,
+					TenantID:     "tenant-a",
+					UserID:       "user-1",
+					AuthMethod:   "bearer",
+					CredentialID: "test-credential",
+					Roles:        []string{"reader"},
+				},
+			}},
+			new(audit.MemorySink),
+		)
+		if err != nil {
+			t.Fatalf("创建应用失败：%v", err)
+		}
+		if err := app.RegisterCapability(newEchoTestCapability(t)); err != nil {
+			t.Fatalf("注册能力失败：%v", err)
+		}
+		handler, err := app.Handler()
+		if err != nil {
+			t.Fatalf("构建 Handler 失败：%v", err)
+		}
+		handlers = append(handlers, handler)
+	}
+	httpServer := httptest.NewServer(&alternatingHandler{handlers: handlers})
+	defer httpServer.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint: httpServer.URL + "/mcp",
+		HTTPClient: &http.Client{
+			Transport: bearerTransport{base: http.DefaultTransport, token: "test-token"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("连接无状态服务失败：%v", err)
+	}
+	defer session.Close()
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil || len(tools.Tools) != 1 {
+		t.Fatalf("跨实例查询 Tool 失败：tools=%+v err=%v", tools, err)
+	}
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "echo",
+		Arguments: map[string]any{"message": "distributed"},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("跨实例调用 Tool 失败：result=%+v err=%v", result, err)
+	}
+}
+
+// TestAppPropagatesRequestCancellation 验证 HTTP 请求取消会终止能力执行。
+func TestAppPropagatesRequestCancellation(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	slow, err := capability.New(capability.Descriptor{
+		ID:          "slow.v1",
+		Name:        "slow",
+		Version:     "v1",
+		Description: "等待请求取消",
+		RiskLevel:   capability.RiskR0,
+		ReadOnly:    true,
+	}, func(ctx context.Context, _ capability.RequestContext, _ echoInput) (echoOutput, error) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return echoOutput{}, ctx.Err()
+	})
+	if err != nil {
+		t.Fatalf("创建慢能力失败：%v", err)
+	}
+	app, err := New(
+		Config{Name: "test", Version: "v1", ExecutionTimeout: time.Minute},
+		HTTPAuthenticationConfig{Authenticator: staticAuthenticator{}},
+		new(audit.MemorySink),
+	)
+	if err != nil {
+		t.Fatalf("创建应用失败：%v", err)
+	}
+	if err := app.RegisterCapability(slow); err != nil {
+		t.Fatalf("注册能力失败：%v", err)
+	}
+	handler, err := app.Handler()
+	if err != nil {
+		t.Fatalf("构建 Handler 失败：%v", err)
+	}
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint: httpServer.URL + "/mcp",
+		HTTPClient: &http.Client{
+			Transport: bearerTransport{base: http.DefaultTransport, token: "test-token"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("连接 MCP Server 失败：%v", err)
+	}
+	defer session.Close()
+
+	callCtx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		_, _ = session.CallTool(callCtx, &mcp.CallToolParams{
+			Name:      "slow",
+			Arguments: map[string]any{"message": "wait"},
+		})
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("能力没有开始执行")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("请求取消没有传递给能力")
+	}
+	<-finished
 }
 
 // TestAppMCPRequiresBearerToken 验证 MCP 端点拒绝匿名请求。
@@ -226,26 +390,23 @@ func TestAppMCPRequiresBearerToken(t *testing.T) {
 	}
 }
 
-// TestAppAPIKeyMCPFlowAndSessionBinding 验证 API Key 双身份流程和 Session 用户绑定。
-func TestAppAPIKeyMCPFlowAndSessionBinding(t *testing.T) {
+// TestAppAPIKeyMCPFlowIsStateless 验证纯 API Key 请求之间不保存协议会话。
+func TestAppAPIKeyMCPFlowIsStateless(t *testing.T) {
 	t.Parallel()
 
 	rawKey := "0123456789abcdef0123456789abcdef"
 	store, err := identity.NewMemoryAPIKeyStore(identity.APIKeyRecord{
-		CredentialID:    "key-1",
-		TenantID:        "tenant-a",
-		ClientID:        "wecom-bot",
-		Digest:          identity.DigestAPIKey(rawKey),
-		SubjectProvider: "wecom",
-		AllowedRoles:    []string{"reader"},
-		Version:         "v1",
+		CredentialID: "key-1",
+		TenantID:     "tenant-a",
+		ClientID:     "service-a",
+		Digest:       identity.DigestAPIKey(rawKey),
+		Roles:        []string{"reader"},
 	})
 	if err != nil {
 		t.Fatalf("创建 Key Store 失败：%v", err)
 	}
 	authenticator, err := identity.NewAPIKeyAuthenticator(
 		store,
-		appSubjectResolver{},
 		identity.APIKeyAuthenticatorConfig{},
 	)
 	if err != nil {
@@ -256,8 +417,6 @@ func TestAppAPIKeyMCPFlowAndSessionBinding(t *testing.T) {
 		HTTPAuthenticationConfig{
 			Authenticator:    authenticator,
 			CredentialHeader: "X-EACG-API-Key",
-			SubjectHeader:    "X-EACG-Requester-UserID",
-			SubjectProvider:  "wecom",
 		},
 		new(audit.MemorySink),
 	)
@@ -291,7 +450,6 @@ func TestAppAPIKeyMCPFlowAndSessionBinding(t *testing.T) {
 	transport := &apiKeyTransport{
 		base: http.DefaultTransport,
 		key:  rawKey,
-		user: "user-1",
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
 	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
@@ -308,8 +466,8 @@ func TestAppAPIKeyMCPFlowAndSessionBinding(t *testing.T) {
 	if err != nil || len(tools.Tools) != 1 {
 		t.Fatalf("查询 API Key Tool 失败：tools=%+v err=%v", tools, err)
 	}
-	transport.SetUser("user-2")
-	if _, err := session.ListTools(context.Background(), nil); err == nil {
-		t.Fatal("更换用户后复用 Session 应失败")
+	tools, err = session.ListTools(context.Background(), nil)
+	if err != nil || len(tools.Tools) != 1 {
+		t.Fatalf("后续独立请求应重新认证：tools=%+v err=%v", tools, err)
 	}
 }

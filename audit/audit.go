@@ -14,8 +14,9 @@ import (
 type Event struct {
 	RequestID       string        `json:"request_id"`
 	TraceID         string        `json:"trace_id"`
+	SubjectType     string        `json:"subject_type"`
 	TenantID        string        `json:"tenant_id"`
-	UserID          string        `json:"user_id"`
+	UserID          string        `json:"user_id,omitempty"`
 	AgentID         string        `json:"agent_id,omitempty"`
 	ClientID        string        `json:"client_id,omitempty"`
 	AuthMethod      string        `json:"auth_method,omitempty"`
