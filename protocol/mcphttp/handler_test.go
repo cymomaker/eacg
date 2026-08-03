@@ -1,4 +1,4 @@
-// 本文件验证 MCP 2026-07-28 HTTP 协议和安全中间件。
+// 本文件验证 MCP 双协议 HTTP 兼容和安全中间件。
 package mcphttp
 
 import (
@@ -34,7 +34,7 @@ func setProtocolHeaders(header http.Header, method string) {
 	header.Set("Authorization", "Bearer valid")
 	header.Set("Content-Type", "application/json")
 	header.Set("Accept", "application/json, text/event-stream")
-	header.Set("Mcp-Protocol-Version", protocolVersion)
+	header.Set("Mcp-Protocol-Version", ProtocolVersion20260728)
 	header.Set("Mcp-Method", method)
 }
 
@@ -126,6 +126,15 @@ func (a subjectCaptureAuthenticator) Authenticate(
 
 // newTestHandler 创建协议测试使用的 HTTP Handler。
 func newTestHandler(t *testing.T, origins []string) http.Handler {
+	return newTestHandlerWithVersions(t, origins, nil)
+}
+
+// newTestHandlerWithVersions 创建指定协议版本的测试 Handler。
+func newTestHandlerWithVersions(
+	t *testing.T,
+	origins []string,
+	versions []string,
+) http.Handler {
 	t.Helper()
 	store := registry.New()
 	engine, err := execution.New(store, new(audit.MemorySink), execution.Config{})
@@ -133,12 +142,13 @@ func newTestHandler(t *testing.T, origins []string) http.Handler {
 		t.Fatalf("创建执行引擎失败：%v", err)
 	}
 	handler, err := New(Config{
-		Name:           "test",
-		Version:        "v1",
-		Registry:       store,
-		Engine:         engine,
-		Authenticator:  bearerTestAuthenticator{},
-		AllowedOrigins: origins,
+		Name:             "test",
+		Version:          "v1",
+		Registry:         store,
+		Engine:           engine,
+		Authenticator:    bearerTestAuthenticator{},
+		AllowedOrigins:   origins,
+		ProtocolVersions: versions,
 	})
 	if err != nil {
 		t.Fatalf("创建 MCP Handler 失败：%v", err)
@@ -273,7 +283,7 @@ func TestHandlerAcceptsCustomCredentialHeader(t *testing.T) {
 	)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json, text/event-stream")
-	request.Header.Set("Mcp-Protocol-Version", protocolVersion)
+	request.Header.Set("Mcp-Protocol-Version", ProtocolVersion20260728)
 	request.Header.Set("Mcp-Method", "server/discover")
 	request.Header.Set("X-EACG-API-Key", "valid-key")
 	request.Header.Set("X-EACG-Requester-UserID", "user-1")
@@ -284,8 +294,8 @@ func TestHandlerAcceptsCustomCredentialHeader(t *testing.T) {
 	}
 }
 
-// TestHandlerSupportsOnlyNewProtocol 验证服务只声明并接受 2026-07-28。
-func TestHandlerSupportsOnlyNewProtocol(t *testing.T) {
+// TestHandlerAdvertisesDefaultProtocols 验证服务默认声明新旧两个协议。
+func TestHandlerAdvertisesDefaultProtocols(t *testing.T) {
 	t.Parallel()
 
 	request := httptest.NewRequest(
@@ -318,8 +328,9 @@ func TestHandlerSupportsOnlyNewProtocol(t *testing.T) {
 		t.Fatalf("解析发现结果失败：%v", err)
 	}
 	if document.Result.ResultType != "complete" ||
-		len(document.Result.SupportedVersions) != 1 ||
-		document.Result.SupportedVersions[0] != protocolVersion {
+		len(document.Result.SupportedVersions) != 2 ||
+		document.Result.SupportedVersions[0] != ProtocolVersion20260728 ||
+		document.Result.SupportedVersions[1] != ProtocolVersion20250618 {
 		t.Fatalf("发现结果协议不正确：%+v", document.Result)
 	}
 	if document.Result.CacheScope != "public" ||
@@ -328,6 +339,194 @@ func TestHandlerSupportsOnlyNewProtocol(t *testing.T) {
 	}
 	if len(document.Result.Capabilities) != 1 || document.Result.Capabilities["tools"] == nil {
 		t.Fatalf("服务只能声明 Tool 能力：%+v", document.Result.Capabilities)
+	}
+}
+
+// TestHandlerSupportsWeComLegacyFlow 验证企业微信 2025-06-18 无状态流程。
+func TestHandlerSupportsWeComLegacyFlow(t *testing.T) {
+	t.Parallel()
+
+	handler := newTestHandler(t, nil)
+	initialize := `{"method":"initialize","params":{"protocolVersion":"2025-06-18",` +
+		`"capabilities":{},"clientInfo":{"name":"wework-mcp-client","version":"1.0.0"}},` +
+		`"jsonrpc":"2.0","id":0}`
+	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(initialize))
+	setLegacyHeaders(request.Header, false)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), `"protocolVersion":"2025-06-18"`) {
+		t.Fatalf("旧版 initialize 失败：code=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Mcp-Session-Id") != "" {
+		t.Fatal("旧版无状态响应不能返回 Mcp-Session-Id")
+	}
+
+	initialized := `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`
+	request = httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(initialized))
+	setLegacyHeaders(request.Header, true)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("旧版 initialized 失败：code=%d body=%s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(
+		http.MethodPost,
+		"/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`),
+	)
+	setLegacyHeaders(request.Header, true)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"tools"`) {
+		t.Fatalf("旧版 tools/list 失败：code=%d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"cacheScope":"private"`) {
+		t.Fatalf("旧版 Tool 列表必须使用私有缓存：%s", response.Body.String())
+	}
+
+	request = httptest.NewRequest(
+		http.MethodPost,
+		"/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}`),
+	)
+	setLegacyHeaders(request.Header, true)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("旧版 ping 失败：code=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// setLegacyHeaders 设置企业微信旧协议请求头。
+func setLegacyHeaders(header http.Header, includeVersion bool) {
+	header.Set("Authorization", "Bearer valid")
+	header.Set("Content-Type", "application/json")
+	header.Set("Accept", "application/json, text/event-stream")
+	if includeVersion {
+		header.Set("Mcp-Protocol-Version", ProtocolVersion20250618)
+	}
+}
+
+// TestHandlerHonorsConfiguredProtocols 验证单协议部署会拒绝未启用版本。
+func TestHandlerHonorsConfiguredProtocols(t *testing.T) {
+	t.Parallel()
+
+	initialize := `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{` +
+		`"protocolVersion":"2025-06-18","capabilities":{},` +
+		`"clientInfo":{"name":"wecom","version":"1.0.0"}}}`
+	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(initialize))
+	setLegacyHeaders(request.Header, false)
+	response := httptest.NewRecorder()
+	newTestHandlerWithVersions(t, nil, []string{ProtocolVersion20260728}).ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest ||
+		!strings.Contains(response.Body.String(), ProtocolVersion20260728) ||
+		strings.Contains(response.Body.String(), `"supported":["2025-06-18"`) {
+		t.Fatalf("新版单协议应拒绝旧版：code=%d body=%s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(
+		http.MethodPost,
+		"/mcp",
+		strings.NewReader(validProtocolBody("server/discover", "")),
+	)
+	setProtocolHeaders(request.Header, "server/discover")
+	response = httptest.NewRecorder()
+	newTestHandlerWithVersions(t, nil, []string{ProtocolVersion20250618}).ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest ||
+		!strings.Contains(response.Body.String(), `"supported":["2025-06-18"]`) {
+		t.Fatalf("旧版单协议应拒绝新版：code=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// TestNewRejectsInvalidProtocolVersions 验证非法和重复协议配置会失败。
+func TestNewRejectsInvalidProtocolVersions(t *testing.T) {
+	t.Parallel()
+
+	for _, versions := range [][]string{
+		{},
+		{"2025-11-25"},
+		{ProtocolVersion20250618, ProtocolVersion20250618},
+		{""},
+	} {
+		store := registry.New()
+		engine, err := execution.New(store, new(audit.MemorySink), execution.Config{})
+		if err != nil {
+			t.Fatalf("创建执行引擎失败：%v", err)
+		}
+		_, err = New(Config{
+			Name:             "test",
+			Version:          "v1",
+			Registry:         store,
+			Engine:           engine,
+			Authenticator:    bearerTestAuthenticator{},
+			ProtocolVersions: versions,
+		})
+		if err == nil {
+			t.Fatalf("非法协议配置应失败：%v", versions)
+		}
+	}
+}
+
+// TestHandlerRejectsInvalidLegacyRequests 验证旧版只允许指定方法并校验初始化版本。
+func TestHandlerRejectsInvalidLegacyRequests(t *testing.T) {
+	t.Parallel()
+
+	conflict := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{`+
+			`"protocolVersion":"2026-07-28","capabilities":{},`+
+			`"clientInfo":{"name":"test","version":"1.0.0"}}}`,
+	))
+	setLegacyHeaders(conflict.Header, true)
+	conflictResponse := httptest.NewRecorder()
+	newTestHandler(t, nil).ServeHTTP(conflictResponse, conflict)
+	if conflictResponse.Code != http.StatusBadRequest {
+		t.Fatalf("旧版 Header/Body 版本冲突应返回 400，实际 %d：%s", conflictResponse.Code, conflictResponse.Body.String())
+	}
+
+	forbidden := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(
+		`{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{}}`,
+	))
+	setLegacyHeaders(forbidden.Header, true)
+	forbiddenResponse := httptest.NewRecorder()
+	newTestHandler(t, nil).ServeHTTP(forbiddenResponse, forbidden)
+	if forbiddenResponse.Code != http.StatusBadRequest ||
+		!strings.Contains(forbiddenResponse.Body.String(), `"code":-32601`) {
+		t.Fatalf("旧版未允许方法应返回 Method Not Found，实际 %d：%s", forbiddenResponse.Code, forbiddenResponse.Body.String())
+	}
+}
+
+// TestHandlerLimitsLegacyInitializeBody 验证旧版初始化也受正文大小限制。
+func TestHandlerLimitsLegacyInitializeBody(t *testing.T) {
+	t.Parallel()
+
+	store := registry.New()
+	engine, err := execution.New(store, new(audit.MemorySink), execution.Config{})
+	if err != nil {
+		t.Fatalf("创建执行引擎失败：%v", err)
+	}
+	handler, err := New(Config{
+		Name:                "test",
+		Version:             "v1",
+		Registry:            store,
+		Engine:              engine,
+		Authenticator:       bearerTestAuthenticator{},
+		MaxRequestBodyBytes: 64,
+	})
+	if err != nil {
+		t.Fatalf("创建 Handler 失败：%v", err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","padding":"`+strings.Repeat("x", 128)+`"}}`),
+	)
+	setLegacyHeaders(request.Header, false)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超大旧版初始化应返回 413：code=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -357,7 +556,7 @@ func TestHandlerRejectsInvalidProtocolHeaders(t *testing.T) {
 		{
 			name: "重复协议版本",
 			setup: func(header http.Header) {
-				header.Add("Mcp-Protocol-Version", protocolVersion)
+				header.Add("Mcp-Protocol-Version", ProtocolVersion20260728)
 			},
 			code: "-32022",
 		},

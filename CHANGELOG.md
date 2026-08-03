@@ -2,6 +2,24 @@
 
 本项目遵循语义化版本。
 
+## [0.2.1] - 2026-08-03
+
+### Added
+
+- 默认同时支持 MCP `2026-07-28` 和企业微信使用的 `2025-06-18`。
+- `Config.MCPProtocolVersions` 支持显式限制服务端协议版本。
+- 导出 `MCPProtocolVersion20260728` 和 `MCPProtocolVersion20250618` 常量。
+
+### Changed
+
+- `2025-06-18` 的首次 `initialize` 可不携带协议 Header，后续请求按该版本规范校验。
+- `server/discover` 根据实际配置返回 `supportedVersions`。
+
+### Security
+
+- 两种协议继续逐请求认证、裁剪 Tool 并执行二次授权。
+- 继续拒绝服务器会话、事件重放、GET 和 DELETE，不恢复 v0.1 会话模型。
+
 ## [0.2.0] - 2026-07-29
 
 ### Changed
@@ -34,5 +52,6 @@
 - 首个 MCP Tool 网关 MVP。
 - 提供 Typed Capability、JWT/API Key、RBAC、审计和 HTTP Connector。
 
+[0.2.1]: https://github.com/cymomaker/eacg/releases/tag/v0.2.1
 [0.2.0]: https://github.com/cymomaker/eacg/releases/tag/v0.2.0
 [0.1.0]: https://github.com/cymomaker/eacg/releases/tag/v0.1.0

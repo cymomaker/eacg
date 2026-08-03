@@ -69,7 +69,7 @@ func main() {
 	}
 	app, err := eacg.New(eacg.Config{
 		Name:                "eacg-example",
-		Version:             "v0.2.0",
+		Version:             "v0.2.1",
 		Address:             envOrDefault("EACG_ADDRESS", "127.0.0.1:8080"),
 		ExecutionTimeout:    5 * time.Second,
 		MaxRequestBodyBytes: 4 << 20,
@@ -82,7 +82,7 @@ func main() {
 	}
 
 	log.Printf(
-		"EACG v0.2.0 示例启动，MCP 2026-07-28 地址：http://%s/mcp",
+		"EACG v0.2.1 示例启动，MCP 2026-07-28 / 2025-06-18 地址：http://%s/mcp",
 		envOrDefault("EACG_ADDRESS", "127.0.0.1:8080"),
 	)
 	if err := app.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

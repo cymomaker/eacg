@@ -1,6 +1,6 @@
 # EACG
 
-EACG 是面向企业业务的 MCP Tool 网关。`v0.2.0` 只支持 MCP `2026-07-28`，使用无状态 Streamable HTTP。
+EACG 是面向企业业务的 MCP Tool 网关。`v0.2.1` 默认同时支持 MCP `2026-07-28` 和 `2025-06-18`，使用无状态 Streamable HTTP。
 
 ## 核心能力
 
@@ -124,6 +124,29 @@ curl -sS http://127.0.0.1:8080/mcp \
 
 每一次请求都必须重新携带认证信息、协议版本、客户端能力和客户端信息。
 
+## MCP 2025-06-18（企业微信）
+
+旧版客户端的首次 `initialize` 可以不带 MCP 协议 Header；服务端从请求体协商版本。后续请求必须携带 `Mcp-Protocol-Version: 2025-06-18`，但不需要新版的 `Mcp-Method` 和 `Mcp-Name` Header：
+
+```bash
+curl -sS http://127.0.0.1:8080/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":0,
+    "method":"initialize",
+    "params":{
+      "protocolVersion":"2025-06-18",
+      "capabilities":{},
+      "clientInfo":{"name":"wework-mcp-client","version":"1.0.0"}
+    }
+  }'
+```
+
+两种协议共用 `/mcp`，均按请求认证且不创建 `Mcp-Session-Id`。可通过 `Config.MCPProtocolVersions` 显式启用单一版本；未配置时按新到旧启用两个版本。
+
 ## API Key 模式
 
 启动：
@@ -151,7 +174,7 @@ Parameter name：X-EACG-API-Key
 
 ## Go 教学客户端
 
-`cmd/eacg-client` 使用官方 Go SDK 展示真实协议流程，并对认证信息做脱敏。
+`cmd/eacg-client` 使用官方 Go SDK 展示 `2026-07-28` 严格协议流程，并对认证信息做脱敏。服务端兼容旧协议不改变该教学客户端的回归目标。
 
 JWT 模式需要两个终端：
 

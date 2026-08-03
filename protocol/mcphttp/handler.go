@@ -2,10 +2,12 @@
 package mcphttp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -25,9 +27,18 @@ const principalExtraKey = "eacg.principal"
 
 // 协议常量用于限制版本和默认请求体大小。
 const (
-	protocolVersion       = "2026-07-28"
+	// ProtocolVersion20260728 表示新版无状态 MCP 协议。
+	ProtocolVersion20260728 = "2026-07-28"
+	// ProtocolVersion20250618 表示企业微信使用的旧版 MCP 协议。
+	ProtocolVersion20250618 = "2025-06-18"
+
 	defaultMaxRequestBody = 4 << 20
 )
+
+var defaultProtocolVersions = []string{
+	ProtocolVersion20260728,
+	ProtocolVersion20250618,
+}
 
 // contextKey 避免请求上下文键与其他包冲突。
 type contextKey string
@@ -50,6 +61,7 @@ type Config struct {
 	SubjectProvider     string
 	Logger              *slog.Logger
 	MaxRequestBodyBytes int64
+	ProtocolVersions    []string
 	AllowedOrigins      []string
 	ResourceMetaURL     string
 }
@@ -77,6 +89,11 @@ func New(config Config) (http.Handler, error) {
 	if config.MaxRequestBodyBytes < 0 {
 		return nil, fmt.Errorf("MCP 请求体大小限制不能小于零")
 	}
+	protocolVersions, err := normalizeProtocolVersions(config.ProtocolVersions)
+	if err != nil {
+		return nil, err
+	}
+	config.ProtocolVersions = protocolVersions
 	protection, err := newCrossOriginProtection(config.AllowedOrigins)
 	if err != nil {
 		return nil, err
@@ -103,7 +120,12 @@ func New(config Config) (http.Handler, error) {
 	authMiddleware := mcpauth.RequireBearerToken(verifier, &mcpauth.RequireBearerTokenOptions{
 		ResourceMetadataURL: config.ResourceMetaURL,
 	})
-	handler := protocolMiddleware(streamable)
+	handler := protocolMiddleware(
+		streamable,
+		config.ProtocolVersions,
+		config.MaxRequestBodyBytes,
+		config.Logger,
+	)
 	handler = authMiddleware(handler)
 	if config.CredentialHeader != "" {
 		handler = credentialHeaderMiddleware(config.CredentialHeader, config.Logger, handler)
@@ -126,7 +148,7 @@ func buildServer(config Config, principal identity.Principal) *mcp.Server {
 			},
 		},
 	)
-	server.AddReceivingMiddleware(resultPolicyMiddleware)
+	server.AddReceivingMiddleware(resultPolicyMiddleware(config.ProtocolVersions))
 
 	for _, item := range config.Registry.Visible(principal) {
 		registerTool(server, config.Engine, item, principal)
@@ -436,49 +458,262 @@ func newCrossOriginProtection(allowed []string) (*http.CrossOriginProtection, er
 	return protection, nil
 }
 
-// protocolMiddleware 只允许 MCP 2026-07-28 无状态请求。
-func protocolMiddleware(next http.Handler) http.Handler {
+// normalizeProtocolVersions 校验并按新到旧返回启用的协议版本。
+func normalizeProtocolVersions(configured []string) ([]string, error) {
+	if configured == nil {
+		return append([]string(nil), defaultProtocolVersions...), nil
+	}
+	if len(configured) == 0 {
+		return nil, fmt.Errorf("MCP 协议版本列表不能为空")
+	}
+	enabled := make(map[string]bool, len(configured))
+	for _, version := range configured {
+		switch version {
+		case ProtocolVersion20260728, ProtocolVersion20250618:
+		default:
+			return nil, fmt.Errorf("不支持的 MCP 协议版本 %q", version)
+		}
+		if enabled[version] {
+			return nil, fmt.Errorf("MCP 协议版本 %q 重复", version)
+		}
+		enabled[version] = true
+	}
+	result := make([]string, 0, len(enabled))
+	for _, version := range defaultProtocolVersions {
+		if enabled[version] {
+			result = append(result, version)
+		}
+	}
+	return result, nil
+}
+
+// protocolMiddleware 允许配置的新版和旧版无状态 MCP 请求。
+func protocolMiddleware(
+	next http.Handler,
+	versions []string,
+	maxRequestBody int64,
+	logger *slog.Logger,
+) http.Handler {
+	enabled := make(map[string]bool, len(versions))
+	for _, version := range versions {
+		enabled[version] = true
+	}
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			writer.Header().Set("Allow", http.MethodPost)
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		headerVersions := request.Header.Values("Mcp-Protocol-Version")
+		requestedVersion := ""
+		if len(headerVersions) == 1 {
+			requestedVersion = headerVersions[0]
+		}
+		method := headerMethod(request)
 		if len(request.Header.Values("Mcp-Session-Id")) > 0 ||
 			len(request.Header.Values("Last-Event-ID")) > 0 {
-			writeProtocolError(writer, -32600, "legacy session headers are not supported", nil)
+			writeProtocolRejection(
+				writer, request, logger, -32600,
+				"legacy session headers are not supported", requestedVersion, method, nil,
+			)
 			return
 		}
-		versions := request.Header.Values("Mcp-Protocol-Version")
-		if len(versions) != 1 || versions[0] != protocolVersion {
-			requested := ""
-			if len(versions) == 1 {
-				requested = versions[0]
+		if len(headerVersions) > 1 {
+			writeUnsupportedProtocol(writer, request, logger, "", method, enabledVersions(enabled))
+			return
+		}
+
+		var envelope legacyInitializeEnvelope
+		legacyEnvelopeRead := false
+		if len(headerVersions) == 0 {
+			var status int
+			var err error
+			envelope, status, err = readLegacyEnvelope(request, maxRequestBody)
+			if err != nil {
+				logProtocolRejection(logger, request, requestedVersion, method, "invalid_initialize")
+				http.Error(writer, err.Error(), status)
+				return
 			}
-			writeProtocolError(writer, mcp.CodeUnsupportedProtocolVersion, "Unsupported protocol version", map[string]any{
-				"supported": []string{protocolVersion},
-				"requested": requested,
-			})
+			requestedVersion = envelope.Params.ProtocolVersion
+			method = envelope.Method
+			legacyEnvelopeRead = true
+			if method != "initialize" {
+				writeUnsupportedProtocol(writer, request, logger, requestedVersion, method, enabledVersions(enabled))
+				return
+			}
+		}
+		if !enabled[requestedVersion] {
+			writeUnsupportedProtocol(writer, request, logger, requestedVersion, method, enabledVersions(enabled))
 			return
 		}
+		if requestedVersion == ProtocolVersion20250618 {
+			if !legacyEnvelopeRead {
+				var status int
+				var err error
+				envelope, status, err = readLegacyEnvelope(request, maxRequestBody)
+				if err != nil {
+					logProtocolRejection(logger, request, requestedVersion, method, "invalid_request")
+					http.Error(writer, err.Error(), status)
+					return
+				}
+				method = envelope.Method
+			}
+			if !legacyProtocolMethod(method) {
+				writeProtocolRejection(
+					writer, request, logger, -32601,
+					"Method not found", requestedVersion, method, nil,
+				)
+				return
+			}
+			if method == "initialize" && envelope.Params.ProtocolVersion != requestedVersion {
+				writeUnsupportedProtocol(
+					writer, request, logger, envelope.Params.ProtocolVersion, method, enabledVersions(enabled),
+				)
+				return
+			}
+			next.ServeHTTP(writer, request)
+			return
+		}
+
 		methods := request.Header.Values("Mcp-Method")
 		if len(methods) != 1 || !validHTTPValue(methods[0], 256) {
-			writeProtocolError(writer, -32600, "Mcp-Method header is required", nil)
+			writeProtocolRejection(
+				writer, request, logger, -32600,
+				"Mcp-Method header is required", requestedVersion, method, nil,
+			)
 			return
 		}
 		if removedProtocolMethod(methods[0]) {
-			writeProtocolError(writer, -32601, "Method not found", nil)
+			writeProtocolRejection(
+				writer, request, logger, -32601,
+				"Method not found", requestedVersion, methods[0], nil,
+			)
 			return
 		}
 		if methods[0] == "tools/call" {
 			names := request.Header.Values("Mcp-Name")
 			if len(names) != 1 || !validHTTPValue(names[0], 128) {
-				writeProtocolError(writer, -32600, "Mcp-Name header is required", nil)
+				writeProtocolRejection(
+					writer, request, logger, -32600,
+					"Mcp-Name header is required", requestedVersion, methods[0], nil,
+				)
 				return
 			}
 		}
 		next.ServeHTTP(writer, request)
 	})
+}
+
+// legacyProtocolMethod 返回旧版无状态端点允许的方法。
+func legacyProtocolMethod(method string) bool {
+	switch method {
+	case "initialize", "notifications/initialized", "ping", "tools/list", "tools/call":
+		return true
+	default:
+		return false
+	}
+}
+
+// legacyInitializeEnvelope 保存旧版请求校验所需的最小字段。
+type legacyInitializeEnvelope struct {
+	Method string `json:"method"`
+	Params struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	} `json:"params"`
+}
+
+// readLegacyEnvelope 在请求体上限内安全预读并恢复旧版请求。
+func readLegacyEnvelope(
+	request *http.Request,
+	maxRequestBody int64,
+) (legacyInitializeEnvelope, int, error) {
+	var envelope legacyInitializeEnvelope
+	body, err := io.ReadAll(io.LimitReader(request.Body, maxRequestBody+1))
+	_ = request.Body.Close()
+	if err != nil {
+		return envelope, http.StatusBadRequest, fmt.Errorf("failed to read request body")
+	}
+	if int64(len(body)) > maxRequestBody {
+		return envelope, http.StatusRequestEntityTooLarge,
+			fmt.Errorf("request body exceeds %d bytes", maxRequestBody)
+	}
+	request.Body = io.NopCloser(bytes.NewReader(body))
+	request.ContentLength = int64(len(body))
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return envelope, http.StatusBadRequest, fmt.Errorf("malformed MCP request")
+	}
+	return envelope, http.StatusOK, nil
+}
+
+// headerMethod 返回不会泄露业务参数的 MCP 方法 Header。
+func headerMethod(request *http.Request) string {
+	values := request.Header.Values("Mcp-Method")
+	if len(values) == 1 {
+		return values[0]
+	}
+	return ""
+}
+
+// enabledVersions 按新到旧返回实际启用的版本。
+func enabledVersions(enabled map[string]bool) []string {
+	result := make([]string, 0, len(enabled))
+	for _, version := range defaultProtocolVersions {
+		if enabled[version] {
+			result = append(result, version)
+		}
+	}
+	return result
+}
+
+// writeUnsupportedProtocol 返回包含实际版本列表的协商错误。
+func writeUnsupportedProtocol(
+	writer http.ResponseWriter,
+	request *http.Request,
+	logger *slog.Logger,
+	requested string,
+	method string,
+	supported []string,
+) {
+	writeProtocolRejection(
+		writer, request, logger, mcp.CodeUnsupportedProtocolVersion,
+		"Unsupported protocol version", requested, method,
+		map[string]any{"supported": supported, "requested": requested},
+	)
+}
+
+// writeProtocolRejection 记录安全诊断字段并返回 JSON-RPC 错误。
+func writeProtocolRejection(
+	writer http.ResponseWriter,
+	request *http.Request,
+	logger *slog.Logger,
+	code int64,
+	message string,
+	version string,
+	method string,
+	data any,
+) {
+	logProtocolRejection(logger, request, version, method, fmt.Sprintf("%d", code))
+	writeProtocolError(writer, code, message, data)
+}
+
+// logProtocolRejection 记录不包含凭据、用户标识和正文的协议错误。
+func logProtocolRejection(
+	logger *slog.Logger,
+	request *http.Request,
+	version string,
+	method string,
+	code string,
+) {
+	if logger == nil {
+		return
+	}
+	logger.Warn(
+		"mcp_protocol_rejected",
+		"request_id", contextString(request.Context(), requestIDKey),
+		"protocol_version", version,
+		"mcp_method", method,
+		"error_code", code,
+	)
 }
 
 // removedProtocolMethod 判断请求是否属于新版已经删除的协议方法。
@@ -514,23 +749,25 @@ func writeProtocolError(writer http.ResponseWriter, code int64, message string, 
 	_ = json.NewEncoder(writer).Encode(response)
 }
 
-// resultPolicyMiddleware 固定协议版本和缓存范围。
-func resultPolicyMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
-	return func(ctx context.Context, method string, request mcp.Request) (mcp.Result, error) {
-		result, err := next(ctx, method, request)
-		if err != nil {
-			return result, err
+// resultPolicyMiddleware 固定发现版本和安全缓存范围。
+func resultPolicyMiddleware(versions []string) func(mcp.MethodHandler) mcp.MethodHandler {
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, request mcp.Request) (mcp.Result, error) {
+			result, err := next(ctx, method, request)
+			if err != nil {
+				return result, err
+			}
+			switch current := result.(type) {
+			case *mcp.DiscoverResult:
+				current.SupportedVersions = append([]string(nil), versions...)
+				current.CacheScope = "public"
+				current.TTLMs = 0
+			case *mcp.ListToolsResult:
+				current.CacheScope = "private"
+				current.TTLMs = 0
+			}
+			return result, nil
 		}
-		switch current := result.(type) {
-		case *mcp.DiscoverResult:
-			current.SupportedVersions = []string{protocolVersion}
-			current.CacheScope = "public"
-			current.TTLMs = 0
-		case *mcp.ListToolsResult:
-			current.CacheScope = "private"
-			current.TTLMs = 0
-		}
-		return result, nil
 	}
 }
 

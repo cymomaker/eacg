@@ -20,6 +20,12 @@ import (
 	"github.com/cymomaker/eacg/registry"
 )
 
+// EACG 支持的 MCP 协议版本。
+const (
+	MCPProtocolVersion20260728 = mcphttp.ProtocolVersion20260728
+	MCPProtocolVersion20250618 = mcphttp.ProtocolVersion20250618
+)
+
 // Config 定义 EACG 应用参数。
 type Config struct {
 	Name                string
@@ -29,6 +35,7 @@ type Config struct {
 	ShutdownTimeout     time.Duration
 	ExecutionTimeout    time.Duration
 	MaxRequestBodyBytes int64
+	MCPProtocolVersions []string
 	AllowedOrigins      []string
 	ResourceMetaURL     string
 }
@@ -132,6 +139,7 @@ func (a *App) Handler() (http.Handler, error) {
 		SubjectProvider:     a.authentication.SubjectProvider,
 		Logger:              a.logger,
 		MaxRequestBodyBytes: a.config.MaxRequestBodyBytes,
+		ProtocolVersions:    a.config.MCPProtocolVersions,
 		AllowedOrigins:      a.config.AllowedOrigins,
 		ResourceMetaURL:     a.config.ResourceMetaURL,
 	})

@@ -1,8 +1,8 @@
-# EACG v0.2.0 技术架构与设计
+# EACG v0.2.1 技术架构与设计
 
 ## 1. 设计目标
 
-EACG 是企业 MCP Tool 网关，负责把业务能力安全地开放给 Agent。当前版本只支持 MCP `2026-07-28`、HTTP 和 R0/R1 只读能力。
+EACG 是企业 MCP Tool 网关，负责把业务能力安全地开放给 Agent。当前版本默认兼容 MCP `2026-07-28`、`2025-06-18`，支持 HTTP 和 R0/R1 只读能力。
 
 设计原则：
 
@@ -20,7 +20,7 @@ flowchart TD
     C["MCP Client / Host"] --> H["HTTP 安全中间件"]
     H --> A["Authenticator"]
     A --> P["Principal"]
-    P --> M["MCP 2026-07-28 Server"]
+    P --> M["MCP 双协议 Server"]
     M --> R["Registry"]
     R --> E["Execution Engine"]
     E --> T["Typed Capability"]
@@ -44,7 +44,7 @@ flowchart TD
 
 ## 3. HTTP 和协议
 
-`/mcp` 只接受 POST。请求必须携带：
+`/mcp` 只接受 POST。`2026-07-28` 请求必须携带：
 
 - `Mcp-Protocol-Version: 2026-07-28`；
 - `Mcp-Method`；
@@ -53,6 +53,8 @@ flowchart TD
 - 当前请求的认证信息。
 
 普通响应为 JSON。SDK 自动提供 `server/discover`、Server Info、`resultType` 和 Header/Body 一致性校验。
+
+`2025-06-18` 的首次 `initialize` 可不带 MCP Header，中间件在请求体上限内预读 `method` 和 `params.protocolVersion` 后恢复 Body。后续请求必须带版本 Header，但不要求 `Mcp-Method`、`Mcp-Name`。初始化、通知、Ping 和 Tool 生命周期由官方 SDK 处理。
 
 Handler 使用：
 
@@ -84,13 +86,13 @@ requestContextMiddleware
 - 自定义 API Key 不会暴露给 SDK 日志；
 - 只有认证成功的调用方才能获得协议发现信息。
 
-协议中间件固定拒绝非 POST、非 `2026-07-28` 请求、缺失方法 Header、旧状态 Header 和已经删除的方法。SDK 继续负责 JSON-RPC 解析、请求元数据校验以及 Header/Body 一致性。
+协议中间件拒绝非 POST、未启用版本、重复/冲突 Header、状态 Header 和不属于所协商版本的方法。SDK 继续负责 JSON-RPC 解析、初始化响应和 Tool 调用；认证仍在协议解析之前完成。
 
 `server/discover` 只返回：
 
 ```json
 {
-  "supportedVersions": ["2026-07-28"],
+  "supportedVersions": ["2026-07-28", "2025-06-18"],
   "capabilities": {
     "tools": {
       "listChanged": false
@@ -151,7 +153,7 @@ Registry 在启动后冻结，各实例必须加载相同能力版本。用户�
 
 ### example 的组装方式
 
-`cmd/eacg-example` 已更新为 `v0.2.0`，用于展示完整接入：
+`cmd/eacg-example` 已更新为 `v0.2.1`，用于展示完整接入：
 
 ```text
 环境变量
@@ -167,7 +169,7 @@ JWT 是默认模式；`make run-api-key` 展示不需要 userid 的 API Key 服�
 
 ## 7. 公开接口变化
 
-相对 `v0.1.0`，业务接入方需要完成以下编译期调整：
+`v0.2.1` 新增 `Config.MCPProtocolVersions`。留空时按新到旧启用两个版本；显式配置只允许 `2026-07-28`、`2025-06-18` 且不得为空或重复。其余相对 `v0.1.0` 的接入调整如下：
 
 - 从 `eacg.Config` 删除 SessionTimeout 配置；
 - 可通过 `MaxRequestBodyBytes` 设置 MCP 请求体上限；

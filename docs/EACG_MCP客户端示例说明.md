@@ -2,7 +2,7 @@
 
 ## 1. 示例解决什么问题
 
-`cmd/eacg-client` 是教学和联调工具。它使用官方 Go SDK 调用 `eacg-example`，同时打印脱敏后的 HTTP 和 JSON-RPC 报文。
+`cmd/eacg-client` 是教学和联调工具。它使用官方 Go SDK 调用 `eacg-example`，同时打印脱敏后的 HTTP 和 JSON-RPC 报文。服务端默认兼容两个协议版本，但本客户端刻意只验证最新版 `2026-07-28`，用于防止新协议回归。
 
 ```text
 eacg-client
