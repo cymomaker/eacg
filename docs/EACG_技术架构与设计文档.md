@@ -1,4 +1,4 @@
-# EACG v0.2.1 技术架构与设计
+# EACG v0.3.0 技术架构与设计
 
 ## 1. 设计目标
 
@@ -153,7 +153,7 @@ Registry 在启动后冻结，各实例必须加载相同能力版本。用户�
 
 ### example 的组装方式
 
-`cmd/eacg-example` 已更新为 `v0.2.1`，用于展示完整接入：
+`cmd/eacg-example` 已更新为 `v0.3.0`，用于展示完整接入：
 
 ```text
 环境变量
@@ -169,7 +169,7 @@ JWT 是默认模式；`make run-api-key` 展示不需要 userid 的 API Key 服�
 
 ## 7. 公开接口变化
 
-`v0.2.1` 新增 `Config.MCPProtocolVersions`。留空时按新到旧启用两个版本；显式配置只允许 `2026-07-28`、`2025-06-18` 且不得为空或重复。其余相对 `v0.1.0` 的接入调整如下：
+`v0.3.0` 继续支持 `Config.MCPProtocolVersions`。留空时按新到旧启用两个版本；显式配置只允许 `2026-07-28`、`2025-06-18` 且不得为空或重复。HTTP Connector 删除重复的 `AllowedHosts`，以固定 `BaseURL` 作为唯一目标，并只允许同 Origin 重定向。其余接入调整如下：
 
 - 从 `eacg.Config` 删除 SessionTimeout 配置；
 - 可通过 `MaxRequestBodyBytes` 设置 MCP 请求体上限；
@@ -188,7 +188,7 @@ Capability、Registry、Execution、Audit 和 HTTPAuthenticationConfig 的使用
 - 输出不超过 1 MiB；
 - Header 长度和控制字符校验；
 - Origin 和 DNS rebinding 防护；
-- HTTP Connector Host 白名单；
+- HTTP Connector 固定 BaseURL、相对路径和同 Origin 重定向限制；
 - 敏感字段递归遮盖；
 - 对外错误隐藏内部细节；
 - 审计记录 Tenant、User、Client、Agent、Credential 和 Capability。

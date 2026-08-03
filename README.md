@@ -1,6 +1,6 @@
 # EACG
 
-EACG 是面向企业业务的 MCP Tool 网关。`v0.2.1` 默认同时支持 MCP `2026-07-28` 和 `2025-06-18`，使用无状态 Streamable HTTP。
+EACG 是面向企业业务的 MCP Tool 网关。`v0.3.0` 默认同时支持 MCP `2026-07-28` 和 `2025-06-18`，使用无状态 Streamable HTTP。
 
 ## 核心能力
 
@@ -11,6 +11,8 @@ EACG 是面向企业业务的 MCP Tool 网关。`v0.2.1` 默认同时支持 MCP 
 - 输入输出校验、字段白名单和敏感字段遮盖；
 - HTTP Connector、结构化审计、健康检查和优雅停机；
 - 无状态部署，不需要会话存储或负载均衡粘滞。
+
+HTTP Connector 以配置中的 `BaseURL` 作为固定目标，只接受相对请求路径，并拒绝跨协议、主机或端口的重定向。目标服务仍需通过 API Key、OAuth2、mTLS 等机制独立鉴权。
 
 普通 MCP 请求返回 `application/json`。只有将来启用 `subscriptions/listen` 时才使用 `text/event-stream` 长连接。
 

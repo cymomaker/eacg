@@ -2,6 +2,22 @@
 
 本项目遵循语义化版本。
 
+## [0.3.0] - 2026-08-03
+
+### Changed
+
+- HTTP Connector 以固定 `BaseURL` 作为唯一目标，只接受相对请求路径。
+- 自定义 `http.Client` 会先被浅拷贝，再安装统一的安全重定向策略。
+
+### Removed
+
+- 删除重复的 `httpconnector.Config.AllowedHosts` 公共字段。
+
+### Security
+
+- HTTP Connector 只允许同协议、主机和有效端口的重定向，并保持最多十次重定向限制。
+- 外部服务仍需独立实施 API Key、OAuth2、mTLS 或其他入站鉴权。
+
 ## [0.2.1] - 2026-08-03
 
 ### Added
@@ -53,5 +69,6 @@
 - 提供 Typed Capability、JWT/API Key、RBAC、审计和 HTTP Connector。
 
 [0.2.1]: https://github.com/cymomaker/eacg/releases/tag/v0.2.1
+[0.3.0]: https://github.com/cymomaker/eacg/releases/tag/v0.3.0
 [0.2.0]: https://github.com/cymomaker/eacg/releases/tag/v0.2.0
 [0.1.0]: https://github.com/cymomaker/eacg/releases/tag/v0.1.0

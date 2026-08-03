@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -22,10 +21,12 @@ var ErrUpstream = errors.New("下游服务调用失败")
 // ErrResponseTooLarge 表示下游响应超过限制。
 var ErrResponseTooLarge = errors.New("下游响应超过大小限制")
 
+// ErrUnsafeRedirect 表示下游尝试重定向到 BaseURL 之外的 Origin。
+var ErrUnsafeRedirect = errors.New("下游重定向目标不允许")
+
 // Config 定义 HTTP Connector 参数。
 type Config struct {
 	BaseURL          string
-	AllowedHosts     []string
 	Timeout          time.Duration
 	MaxResponseBytes int64
 	DefaultHeaders   http.Header
@@ -68,29 +69,69 @@ func New(config Config) (*Connector, error) {
 	if baseURL.User != nil || baseURL.Hostname() == "" {
 		return nil, fmt.Errorf("BaseURL 不能包含用户信息且必须包含主机")
 	}
-	if !hostAllowed(baseURL.Hostname(), config.AllowedHosts) {
-		return nil, fmt.Errorf("BaseURL 主机不在白名单中")
-	}
-	if ip := net.ParseIP(baseURL.Hostname()); ip != nil && isPrivateIP(ip) && !hostListed(baseURL.Hostname(), config.AllowedHosts) {
-		return nil, fmt.Errorf("私有 IP 必须显式加入白名单")
-	}
-
 	if config.Timeout <= 0 {
 		config.Timeout = 5 * time.Second
 	}
 	if config.MaxResponseBytes <= 0 {
 		config.MaxResponseBytes = 1024 * 1024
 	}
-	client := config.Client
-	if client == nil {
-		client = &http.Client{Timeout: config.Timeout}
-	}
+	client := cloneHTTPClient(config.Client, config.Timeout)
+	client.CheckRedirect = secureRedirectPolicy(baseURL, client.CheckRedirect)
 	return &Connector{
 		baseURL:          baseURL,
 		client:           client,
 		defaultHeaders:   config.DefaultHeaders.Clone(),
 		maxResponseBytes: config.MaxResponseBytes,
 	}, nil
+}
+
+// cloneHTTPClient 复制调用方的 Client，避免安装安全策略时修改共享实例。
+func cloneHTTPClient(source *http.Client, timeout time.Duration) *http.Client {
+	if source == nil {
+		return &http.Client{Timeout: timeout}
+	}
+	cloned := *source
+	if cloned.Timeout <= 0 {
+		cloned.Timeout = timeout
+	}
+	return &cloned
+}
+
+// secureRedirectPolicy 只允许固定 BaseURL Origin 内的有限次重定向。
+func secureRedirectPolicy(baseURL *url.URL, original func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	return func(request *http.Request, via []*http.Request) error {
+		if request.URL.User != nil || !sameOrigin(baseURL, request.URL) {
+			return fmt.Errorf("%w：%s", ErrUnsafeRedirect, request.URL.Redacted())
+		}
+		if len(via) >= 10 {
+			return errors.New("下游重定向次数超过 10 次")
+		}
+		if original != nil {
+			return original(request, via)
+		}
+		return nil
+	}
+}
+
+// sameOrigin 比较协议、主机名和有效端口。
+func sameOrigin(left, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		effectivePort(left) == effectivePort(right)
+}
+
+func effectivePort(target *url.URL) string {
+	if port := target.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(target.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 // Invoke 调用下游 HTTP 服务并读取 JSON 响应。
@@ -120,7 +161,7 @@ func (c *Connector) Invoke(ctx context.Context, request Request) (Response, erro
 
 	httpResponse, err := c.client.Do(httpRequest)
 	if err != nil {
-		return Response{}, fmt.Errorf("%w：%v", ErrUpstream, err)
+		return Response{}, fmt.Errorf("%w：%w", ErrUpstream, err)
 	}
 	defer httpResponse.Body.Close()
 
@@ -180,27 +221,4 @@ func copyHeaders(target, source http.Header) {
 			target.Add(key, value)
 		}
 	}
-}
-
-// hostAllowed 检查主机是否符合白名单。
-func hostAllowed(host string, allowed []string) bool {
-	if len(allowed) == 0 {
-		return net.ParseIP(host) == nil
-	}
-	return hostListed(host, allowed)
-}
-
-// hostListed 检查主机是否被明确列出。
-func hostListed(host string, allowed []string) bool {
-	for _, item := range allowed {
-		if strings.EqualFold(host, item) {
-			return true
-		}
-	}
-	return false
-}
-
-// isPrivateIP 判断 IP 是否属于本地或私有网络。
-func isPrivateIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
